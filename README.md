@@ -93,12 +93,19 @@ FastAPI creates these directories during startup if they are missing, and `.giti
 
 | Path                                          | Description                                                                                    |
 | --------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `GET /api/display`                            | Main firmware endpoint: returns `image_url`, `filename`, refresh hints, and playlist metadata. |
-| `POST /api/log`                               | Device log ingestion recorded via SQLAlchemy.                                                  |
-| `POST /api/battery`                           | Battery + RSSI samples persisted to `BatteryStatus`.                                           |
-| `GET /image/screen.bmp` / `screen1.bmp`       | Alternating BMP endpoints to break caches.                                                     |
-| `GET /image/grayscale.png` / `grayscale1.png` | Optional grayscale preview for firmware that supports it.                                      |
+| `GET /api/setup`, `/api/setup/`               | Enrolment. MAC allowlist only — the device does not hold a token yet.                          |
+| `GET /api/display`                            | Main firmware endpoint: returns `image_url`, `filename` and refresh hints. MAC + Access-Token. |
+| `POST /api/log`, `/api/logs`                  | Device log ingestion. Unauthenticated by necessity; body-capped, rate-limited, row-capped.     |
+| `GET /image/screen-NNN-<16 hex>.bmp`          | The current panel frame. The unguessable name *is* the capability — never log it.              |
+| `GET /preview/<slug>.png`                     | Browser preview of one screen. Access-Token required.                                          |
 | `GET /web/*`                                  | Static dashboard assets (HTML/JS/CSS/fonts and fallback imagery).                              |
-| `GET /generated/*`                            | Runtime plugin output (BMP/PNG) served as-is.                                                  |
+| `GET /generated/*`                            | Plugin output, but only URLs the current rotation publishes, served from memory. Not a mount.  |
+| `POST`/`DELETE`/`GET /auth/session`           | Mint, clear and inspect the control-plane session cookie (`TRMNL_UI_TOKEN_FILE`).              |
+| control plane                                 | `/rotation`, `/playlists`, `/devices`, `/status`, `/server/*` — all require the UI session.    |
+
+Only `/api/*` and `/image/*` are outside the edge's SSO gate, because the
+ESP32 cannot follow an SSO redirect. Nothing else may be registered under
+`/api/` — `main.py::_assert_route_invariants()` refuses to build the app if
+it is.
 
 The UI under `web/` shows plugin output previews and rotation metadata; templates in `templates/` are used by specific plugins (e.g., weather renderer).
