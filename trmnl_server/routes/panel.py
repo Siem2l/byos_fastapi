@@ -325,11 +325,14 @@ def _publish_to_ui(device_id: str, slug: str | None) -> None:
     Feeds the device card's "Now showing" line and its thumbnail. The
     thumbnail points at the plugin scheduler's copy of the same screen
     under /generated/... rather than at /preview/<slug>.png, because a
-    browser cannot attach the Access-Token header that route requires —
-    and /generated is behind the same edge SSO as the rest of the UI, so
-    nothing is exposed by doing so. It may lag the panel by up to one
-    plugin TTL; `hash` is the cache-buster the UI appends, so it updates
-    as soon as the scheduler re-renders.
+    browser cannot attach the Access-Token header that route requires.
+    /generated is behind the same edge SSO as the rest of the UI, and the
+    app now serves only the URLs the current rotation snapshot publishes
+    (routes/images.py::serve_generated) rather than a directory, so this
+    hands out a reference to a frame the same viewer can already see and
+    nothing more. It may lag the panel by up to one plugin TTL; `hash` is
+    the cache-buster the UI appends, so it updates as soon as the scheduler
+    re-renders.
     """
     if not slug:
         return

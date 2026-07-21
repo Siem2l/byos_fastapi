@@ -8,7 +8,6 @@ from time import time
 from io import BytesIO
 from threading import RLock
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
 
 from fastapi import Request
 
@@ -41,26 +40,16 @@ def get_server_base_url() -> str:
     return _server_base_url or f"{config.SERVER_SCHEME}://{utils.get_ip_address()}:{config.SERVER_PORT}"
 
 
-def update_device_preview(
-    device_id: str,
-    device_state: Optional[Dict[str, Any]],
-    entry_index: Optional[int]
-) -> Tuple[Optional[str], Optional[str]]:
-    if entry_index is None or entry_index < 0:
-        return None, None
-    target_state = device_state or get_device_state(device_id)
-    with STATE_LOCK:
-        previous_index = target_state.get('current_preview_entry_index')
-        target_state['current_preview_entry_index'] = entry_index
-        existing_token = target_state.get('current_preview_token')
-        if previous_index == entry_index and existing_token:
-            token = str(existing_token)
-        else:
-            sequence = int(target_state.get('token_sequence', 0))
-            token = sha1(f"{device_id}-{entry_index}-{sequence}".encode('utf-8')).hexdigest()[:16]
-            target_state['current_preview_token'] = token
-        target_state['current_preview_url'] = f"/preview/{quote(device_id)}?token={token}"
-        return target_state['current_preview_url'], token
+# `update_device_preview()` used to live here. It built
+# `/preview/<device_id>?token=<sha1>` — upstream's ungated preview route,
+# which this fork deliberately does not register (see routes/images.py: the
+# `{device_id}` pattern would also have matched the literal `readiness.png`
+# and shadowed the token-gated route with an anonymous one). It had no
+# callers and no route matched the URL it produced, so it was dead code whose
+# only plausible future was somebody wiring it back up and quietly
+# reintroducing an unauthenticated frame endpoint. `routes/panel.py`
+# ::_publish_to_ui sets `current_preview_url` from the rotation entry's
+# `url_png` instead. `preview_frame_entry_index()` went with it.
 
 
 def _client_metrics_store() -> Dict[str, Dict[str, Any]]:
@@ -828,14 +817,6 @@ def current_frame_entry_index(device_state: Dict[str, Any]) -> Optional[int]:
         current = device_state.get('current_entry_index')
         if isinstance(current, int) and current >= 0:
             return current
-    return None
-
-
-def preview_frame_entry_index(device_state: Dict[str, Any]) -> Optional[int]:
-    with STATE_LOCK:
-        preview = device_state.get('current_preview_entry_index')
-        if isinstance(preview, int) and preview >= 0:
-            return preview
     return None
 
 
