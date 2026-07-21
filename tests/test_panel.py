@@ -424,14 +424,33 @@ def test_generated_refuses_anything_not_in_the_rotation(ui_client):
 # --- LATENT: nothing but the device surface may live under /api/ -----------
 
 
-def test_only_known_device_routes_live_under_api(client):
-    from trmnl_server.main import _DEVICE_API_PATHS
+def test_the_route_walk_sees_the_whole_app(client):
+    """Every negative route invariant is worthless if the walk finds nothing.
 
-    under_api = {
-        route.path
-        for route in client.app.routes
-        if getattr(route, "path", "").startswith("/api/")
-    }
+    `app.routes` stopped being a flat list of APIRoutes in FastAPI ~0.137,
+    which turned both invariants below into vacuous truths. This is the
+    assertion that catches that on a nixpkgs bump instead of production.
+    """
+    from trmnl_server.main import route_paths
+
+    paths = route_paths(client.app)
+    # A representative path from every router the app includes.
+    assert {
+        "/api/display",        # panel
+        "/rotation",           # control plane
+        "/auth/session",       # session minting
+        "/generated/{path:path}",  # images
+        "/",                   # pages
+    } <= paths, sorted(paths)
+    assert len(paths) >= 20, sorted(paths)
+
+
+def test_only_known_device_routes_live_under_api(client):
+    from trmnl_server.main import _DEVICE_API_PATHS, _under_api, route_paths
+
+    paths = route_paths(client.app)
+    assert paths, "the route walk collected nothing"
+    under_api = {path for path in paths if _under_api(path)}
     assert under_api <= _DEVICE_API_PATHS
     # And the device surface is actually registered, so this cannot pass by
     # the routes having silently disappeared.
@@ -514,6 +533,49 @@ def test_log_endpoint_still_rejects_an_absurd_body(client):
     assert client.post(
         "/api/log", content=iter([b"x" * 8192] * 32)
     ).status_code == 413
+
+
+def test_a_stray_router_under_api_is_seen_through_the_include_wrapper(client):
+    """The same check, but via `include_router` rather than a bare decorator.
+
+    This is the shape that actually regressed: FastAPI >= ~0.137 leaves an
+    opaque wrapper in `app.routes` for each included router, so a stray
+    control-plane route added this way was invisible to the guard.
+    """
+    from fastapi import APIRouter
+
+    from trmnl_server.main import _assert_route_invariants, route_paths
+
+    stray = APIRouter(prefix="/api")
+
+    @stray.get("/status")
+    def _stray():  # pragma: no cover - never called
+        return {}
+
+    client.app.include_router(stray)
+    assert "/api/status" in route_paths(client.app)
+    with pytest.raises(RuntimeError, match="registered under /api/"):
+        _assert_route_invariants(client.app)
+
+
+def test_route_invariants_refuse_an_empty_walk(client):
+    """An empty route table must be an error, not a pass."""
+    from trmnl_server.main import _assert_route_invariants
+
+    empty = type("FakeApp", (), {"router": type("R", (), {"routes": []})()})()
+    with pytest.raises(RuntimeError, match="found no routes at all"):
+        _assert_route_invariants(empty)
+
+
+def test_control_plane_routes_are_all_found_and_guarded(client):
+    """Invariant 2 must be checked against real routes, not an empty set."""
+    from trmnl_server.routes.api import router as api_router
+    from trmnl_server.main import route_paths
+
+    paths = route_paths(client.app)
+    control_plane = {route.path for route in api_router.routes}
+    assert control_plane, "the control-plane router registered nothing"
+    assert control_plane <= paths, sorted(control_plane - paths)
 
 
 # --- B: the refresh clamp holds on READ, not only on write ----------------

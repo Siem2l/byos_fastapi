@@ -98,6 +98,57 @@ def _mount_static(app: FastAPI) -> None:
     # Depends(), which is the other half of why this had to become a route.
 
 
+def _walk_routes(routes, prefix: str = ""):
+    """Yield `(effective_path, route_like)` for every leaf route in `routes`.
+
+    `app.routes` is not a flat list of `APIRoute`s, and has not been one
+    since FastAPI ~0.137: `include_router()` now leaves an opaque
+    `_IncludedRouter` in the table that exposes neither `.path` nor
+    `.routes`, and resolves its children lazily through
+    `effective_route_contexts()`. Both invariants below are of the form "no
+    route does X", so the moment iteration stops seeing real routes they
+    stop failing — silently, correctly, and for the wrong reason. Verified:
+    with fastapi 0.136.3 the suite is 50 passed; with 0.139.2 the two route
+    invariants were the only failures, and they failed by finding nothing at
+    all to check. A nixpkgs bump is all it would have taken in production.
+
+    So: recurse, and duck-type rather than isinstance-check, so this keeps
+    working on the versions that do and do not have the wrapper.
+
+    * anything exposing `effective_route_contexts()` is a FastAPI >= 0.137
+      include wrapper — its contexts already carry the fully-prefixed path;
+    * anything exposing `.routes` is a Starlette `Mount`/`Router`, whose
+      children's paths are relative to its own;
+    * everything else is a leaf.
+    """
+    for route in routes:
+        contexts = getattr(route, "effective_route_contexts", None)
+        if callable(contexts):
+            for ctx in contexts():
+                yield prefix + (getattr(ctx, "path", "") or ""), ctx
+            continue
+        path = prefix + (getattr(route, "path", "") or "")
+        nested = getattr(route, "routes", None)
+        if nested:
+            yield from _walk_routes(nested, path)
+            continue
+        yield path, route
+
+
+def route_paths(app: FastAPI) -> set[str]:
+    """Every path the built app actually serves. Also used by the tests."""
+    return {path for path, _route in _walk_routes(app.router.routes)}
+
+
+def _under_api(path: str) -> bool:
+    """True for the prefix the edge bypasses SSO for — and only that prefix.
+
+    `/api` itself counts (a sub-application mounted there would serve
+    `/api/anything`); `/apidocs` does not.
+    """
+    return path == "/api" or path.startswith("/api/")
+
+
 def _assert_route_invariants(app: FastAPI) -> None:
     """Fail at startup rather than in production on an auth-shape regression.
 
@@ -110,10 +161,25 @@ def _assert_route_invariants(app: FastAPI) -> None:
     2. Every control-plane route must carry `require_ui_session`. The
        dependency is attached to the router, so this holds by construction —
        this asserts that it *stayed* attached.
+
+    Both are negative assertions, so the dangerous failure is not a false
+    alarm but an empty walk. Everything below therefore proves it looked at
+    something before concluding anything: a non-zero route count, a non-empty
+    control-plane router, and every control-plane path actually reachable in
+    the built app.
     """
-    for route in app.routes:
-        path = getattr(route, "path", "")
-        if path.startswith("/api/") and path not in _DEVICE_API_PATHS:
+    collected = list(_walk_routes(app.router.routes))
+    if not collected:
+        raise RuntimeError(
+            "route invariant check walked the app and found no routes at "
+            "all. That is not a clean bill of health — every check below is "
+            'of the form "no route does X", so an empty walk passes them '
+            "vacuously. The route container shape has changed (see "
+            "_walk_routes); fix the walk before trusting this app."
+        )
+
+    for path, _route in collected:
+        if _under_api(path) and path not in _DEVICE_API_PATHS:
             raise RuntimeError(
                 f"route {path!r} is registered under /api/, which the Pangolin "
                 "edge bypasses SSO for. Control-plane routes must live "
@@ -121,17 +187,28 @@ def _assert_route_invariants(app: FastAPI) -> None:
                 "firmware endpoint, add it to _DEVICE_API_PATHS explicitly."
             )
 
-    guarded = {
-        getattr(route, "path", "")
-        for route in api_router.routes
-    }
-    for route in app.routes:
-        path = getattr(route, "path", "")
+    guarded = {getattr(route, "path", "") for route in api_router.routes}
+    guarded.discard("")
+    if not guarded:
+        raise RuntimeError(
+            "the control-plane router exposes no routes, so invariant 2 "
+            "would hold vacuously — see routes/api.py"
+        )
+    seen = {path for path, _route in collected}
+    missing = guarded - seen
+    if missing:
+        raise RuntimeError(
+            f"control-plane routes {sorted(missing)} are registered on "
+            "api_router but were not found in the built app. The walk is "
+            "not seeing them, so their require_ui_session check below is "
+            "not being made — see _walk_routes."
+        )
+
+    for path, route in collected:
         if path not in guarded:
             continue
-        calls = [
-            dep.call for dep in getattr(route, "dependant", None).dependencies
-        ] if getattr(route, "dependant", None) else []
+        dependant = getattr(route, "dependant", None)
+        calls = [dep.call for dep in dependant.dependencies] if dependant else []
         if require_ui_session not in calls:
             raise RuntimeError(
                 f"control-plane route {path!r} is not guarded by "
