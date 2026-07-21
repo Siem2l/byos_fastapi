@@ -45,6 +45,7 @@ from fastapi.responses import JSONResponse, Response
 
 from .. import config, utils
 from ..services import state
+from .auth import has_ui_session
 from .panel import authorised
 
 router = APIRouter()
@@ -78,8 +79,25 @@ def _not_found() -> JSONResponse:
 
 
 @router.get('/generated/{path:path}')
-def serve_generated(path: str) -> Response:
+def serve_generated(path: str, request: Request) -> Response:
     """Serve a plugin-generated frame, but only if the rotation publishes it.
+
+    Authenticated, because `/preview/<slug>.png` is. Both routes hand back
+    the same Garmin render — one drawn on demand, one drawn by the plugin
+    scheduler — so an unauthenticated `/generated/...` is not a smaller hole
+    than an unauthenticated `/preview/...`, it is the same hole reached by a
+    sibling route. Relying on the edge alone to tell them apart is exactly
+    the assumption `routes/auth.py` exists to reject: the app cannot see
+    whether Authentik ran, one broadened bypass rule covers this prefix, and
+    the rule that already exists (`/image/*`) is one character away from
+    matching `/images/`.
+
+    Two credentials are accepted, and both are ones the caller already has:
+    a control-plane session cookie (what the UI's `<img>` tags send —
+    same-site, so `SameSite=Strict` does not block them), or the panel's
+    Access-Token (what `/preview` takes). When no `TRMNL_TOKEN_FILE` is
+    configured `authorised()` returns True, so a LAN deployment behaves
+    exactly as `/preview` does — one rule, not two.
 
     This replaces `app.mount("/generated", StaticFiles(...))`. The mount was
     not an internet-facing hole — `/generated/*` matches neither of the
@@ -110,6 +128,12 @@ def serve_generated(path: str) -> Response:
     an oversized payload to four dithered grey levels. These are mode-"1"
     renders and must stay that way.
     """
+    # Before the path check, so an unauthenticated caller cannot use the
+    # 404-vs-401 split to enumerate which renders the rotation is publishing.
+    if not (has_ui_session(request) or authorised(request)):
+        return JSONResponse(
+            {'status': 401, 'error': 'unauthorised'}, status_code=401
+        )
     if not _GENERATED_RE.match(path):
         return _not_found()
     url = f'/generated/{path}'
