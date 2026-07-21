@@ -91,6 +91,14 @@ _PINNED_WEB_STATIC_DIR: str | None = (
     _PACKAGED_WEB_DIR if isdir(_PACKAGED_WEB_DIR) else None
 )
 _PINNED_WEB_GENERATED_DIR: str | None = None
+# Same treatment for the SQLite file, and for the same reason: without it
+# `_refresh_path_constants()` silently resets DATABASE_PATH back to
+# `$PWD/var/db/trmnl.db` every time anything touches a path constant, which
+# discards TRMNL_DB_PATH. Under the unit that path is unwritable, so the
+# effect is a service that will not start — and `pin_generated_assets_dir()`
+# calls `_refresh_path_constants()`, so it happened on every boot that set
+# TRMNL_DB_PATH.
+_PINNED_DATABASE_PATH: str | None = None
 
 VAR_ROOT = join(CONFIG_DIR, 'var')
 DATABASE_PATH = join(VAR_ROOT, 'db', 'trmnl.db')
@@ -190,7 +198,7 @@ def _refresh_path_constants() -> None:
     global VAR_ROOT, DATABASE_PATH, LOGS_DIR, SSL_DIR
     global WEB_ROOT_DIR, WEB_STATIC_DIR, WEB_GENERATED_DIR
     VAR_ROOT = join(CONFIG_DIR, 'var')
-    DATABASE_PATH = join(VAR_ROOT, 'db', 'trmnl.db')
+    DATABASE_PATH = _PINNED_DATABASE_PATH or join(VAR_ROOT, 'db', 'trmnl.db')
     LOGS_DIR = join(VAR_ROOT, 'logs')
     SSL_DIR = join(VAR_ROOT, 'ssl')
     WEB_ROOT_DIR = _PINNED_WEB_STATIC_DIR or join(CONFIG_DIR, ASSETS_ROOT)
@@ -199,13 +207,29 @@ def _refresh_path_constants() -> None:
 
 
 def pin_generated_assets_dir(path: str) -> None:
-    """Point the generated-asset root (served at /generated) at `path`.
+    """Point the generated-asset root at `path`.
 
     Called once from `create_app()` with `<TRMNL_STATE_DIR>/generated`, the
-    one directory the unit is guaranteed to be able to write to.
+    one directory the unit is guaranteed to be able to write to. This is the
+    plugin scheduler's output directory and the root
+    `utils.path_to_web_url()` rewrites to the `/generated/...` URL prefix; it
+    is not an HTTP document root (nothing is served straight off disk from
+    here — see `routes/images.py::serve_generated`).
     """
     global _PINNED_WEB_GENERATED_DIR
     _PINNED_WEB_GENERATED_DIR = abspath(path)
+    _refresh_path_constants()
+
+
+def pin_database_path(path: str) -> None:
+    """Pin the SQLite location so path refreshes cannot move it.
+
+    Assigning `DATABASE_PATH` directly does not survive: any later call into
+    `_refresh_path_constants()` — `pin_generated_assets_dir()` makes one —
+    recomputes it from CONFIG_DIR.
+    """
+    global _PINNED_DATABASE_PATH
+    _PINNED_DATABASE_PATH = abspath(path)
     _refresh_path_constants()
 
 
@@ -406,4 +430,4 @@ def set_panel_config(cfg: Config) -> None:
 # location has to be pinned via the environment before the process starts.
 _db_override = environ.get('TRMNL_DB_PATH')
 if _db_override:
-    DATABASE_PATH = _db_override
+    pin_database_path(_db_override)
