@@ -225,6 +225,25 @@ def authorised(request: Request) -> bool:
     return hmac.compare_digest(supplied.strip(), expected)
 
 
+def _device_label(device: str | None) -> str:
+    """A short, non-credential handle for a panel, safe to persist.
+
+    The raw device ID is the panel's MAC, and the MAC *is* the credential
+    that `/api/setup` checks — `allowedDevices` is the only thing standing
+    between a passer-by and a free copy of the access token, since enrolment
+    necessarily predates the device holding one. Writing it into the `logs`
+    table would publish that credential to every reader of `/server/log`.
+
+    So the log DB gets the same six hex digits the firmware already displays
+    as its friendly_id: enough to tell two panels apart in an audit trail,
+    not enough to enrol. The full MAC still goes to the journal via
+    `_note_device()`, which is root-readable only and is where the operator
+    is told to look when transcribing it into `allowedDevices`.
+    """
+    normalised = normalise_mac(device or '')
+    return normalised[-6:].upper() if normalised else 'unknown'
+
+
 def _note_device(device: str | None) -> None:
     """Log each device ID once, loudly.
 
@@ -335,7 +354,7 @@ def api_setup(request: Request) -> JSONResponse:
             {"status": 403, "error": "unknown device"}, status_code=403
         )
     token = cfg.token()
-    models.add_log_entry("/api/setup", f"enrolled device {normalise_mac(device or '')}")
+    models.add_log_entry("/api/setup", f"enrolled device {_device_label(device)}")
     return JSONResponse({
         "status": 200,
         "api_key": token or "",
@@ -376,9 +395,16 @@ def api_display(request: Request) -> JSONResponse:
     if isinstance(override, int) and override > 0:
         refresh = override
 
+    # NEVER put `name` in here. It is the live frame nonce, and that nonce is
+    # the *only* thing protecting `/image/<name>` — the firmware fetches the
+    # image with no auth header at all, so an unguessable path is the whole
+    # capability. Logging it would mean two requests (poll the log, fetch the
+    # frame) yields the panel's health data, which is exactly the exposure
+    # the nonce exists to prevent. The screen slug and the refresh interval
+    # are what an operator actually needs from this line.
     models.add_log_entry(
         "/api/display",
-        f"device={device_id} screen={renderer.slug} frame={name} refresh={refresh}s",
+        f"device={_device_label(device)} screen={renderer.slug} refresh={refresh}s",
     )
     return JSONResponse({
         "status": 0,
