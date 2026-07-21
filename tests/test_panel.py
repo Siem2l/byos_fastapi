@@ -53,6 +53,10 @@ def _reset_process_state() -> None:
         state_module.global_state['device_playlists'] = {}
         state_module.global_state['named_playlists'] = {}
         state_module.global_state['device_playlist_bindings'] = {}
+        # Profiles are cached in front of SQLite, and each test gets a fresh
+        # database — so without this a refresh_interval written by one test
+        # is still in memory for the next one, whose DB has never seen it.
+        state_module.global_state['device_profiles'] = {}
 
 
 @pytest.fixture()
@@ -447,6 +451,58 @@ def test_registering_a_control_plane_route_under_api_fails_the_build(client):
     client.app.include_router(stray)
     with pytest.raises(RuntimeError, match="registered under /api/"):
         _assert_route_invariants(client.app)
+
+
+# --- B: the refresh clamp holds on READ, not only on write ----------------
+
+
+def test_display_clamps_a_hostile_row_written_straight_into_the_db(client):
+    """A row that never passed PATCH must still not reach the panel.
+
+    The write-side check only ever sees values that arrive through it. This
+    writes 1 second directly into `device_profiles`, exactly as a skeptic
+    with the SQLite file (or an older build whose PATCH was unauthenticated)
+    would, and asserts the panel is not told to poll every second.
+    """
+    from trmnl_server.config import MIN_REFRESH_INTERVAL
+    from trmnl_server.services import state as state_module
+
+    device_id = MAC
+    models.update_device_profile(device_id, refresh_interval=1)
+    with state_module.STATE_LOCK:
+        state_module.global_state.get('device_profiles', {}).pop(device_id, None)
+    state_module.refresh_device_profile(device_id)
+    assert models.get_device_profile(device_id)["refresh_interval"] == 1
+
+    resp = client.get(
+        "/api/display", headers={"ID": MAC, "Access-Token": TOKEN}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["refresh_rate"] == MIN_REFRESH_INTERVAL
+
+
+def test_display_clamps_an_absurdly_long_interval(client):
+    from trmnl_server.config import MAX_REFRESH_INTERVAL
+    from trmnl_server.services import state as state_module
+
+    models.update_device_profile(MAC, refresh_interval=86400)
+    state_module.refresh_device_profile(MAC)
+    resp = client.get(
+        "/api/display", headers={"ID": MAC, "Access-Token": TOKEN}
+    )
+    assert resp.json()["refresh_rate"] == MAX_REFRESH_INTERVAL
+
+
+def test_display_honours_an_in_range_interval(client):
+    """The clamp must not flatten the knob it is protecting."""
+    from trmnl_server.services import state as state_module
+
+    models.update_device_profile(MAC, refresh_interval=900)
+    state_module.refresh_device_profile(MAC)
+    resp = client.get(
+        "/api/display", headers={"ID": MAC, "Access-Token": TOKEN}
+    )
+    assert resp.json()["refresh_rate"] == 900
 
 
 # --- C: a non-ASCII credential is a 401, never a 500 ----------------------
