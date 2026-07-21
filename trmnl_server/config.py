@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from os import environ, getcwd
-from os.path import abspath, isdir, join
+from os.path import abspath, dirname, isdir, join
 from sys import stdout
 
 # Logging Configuration
@@ -71,12 +71,33 @@ EINK_TONE_POINTS = '0:0,32:6,64:18,85:32,128:95,170:155,192:190,224:225,255:250'
 EINK_TONE_GAMMA = 1.0
 
 CONFIG_DIR = getcwd()
+
+# Upstream resolves every runtime directory relative to the working
+# directory. Under the NixOS unit there is no WorkingDirectory and
+# DynamicUser starts in `/`, so `web` and `var/generated` would resolve to
+# `/web` and `/var/generated` — neither of which exists, and both of which
+# `ProtectSystem = "strict"` makes unwritable. StaticFiles() raises at
+# construction when its directory is missing, so that would take the whole
+# unit down at startup rather than merely breaking the UI.
+#
+# Both roots are therefore pinned to locations that are correct by
+# construction: the static assets to the copy installed inside the package,
+# and the generated (volatile) assets to the service's StateDirectory. The
+# pins survive `_refresh_path_constants()`, so a persisted `static_root` /
+# `generated_root` row cannot move them back out from under a running
+# deployment.
+_PACKAGED_WEB_DIR = join(dirname(abspath(__file__)), 'web')
+_PINNED_WEB_STATIC_DIR: str | None = (
+    _PACKAGED_WEB_DIR if isdir(_PACKAGED_WEB_DIR) else None
+)
+_PINNED_WEB_GENERATED_DIR: str | None = None
+
 VAR_ROOT = join(CONFIG_DIR, 'var')
 DATABASE_PATH = join(VAR_ROOT, 'db', 'trmnl.db')
 LOGS_DIR = join(VAR_ROOT, 'logs')
 SSL_DIR = join(VAR_ROOT, 'ssl')
-WEB_ROOT_DIR = join(CONFIG_DIR, ASSETS_ROOT)
-WEB_STATIC_DIR = join(CONFIG_DIR, STATIC_ROOT)
+WEB_ROOT_DIR = _PINNED_WEB_STATIC_DIR or join(CONFIG_DIR, ASSETS_ROOT)
+WEB_STATIC_DIR = _PINNED_WEB_STATIC_DIR or join(CONFIG_DIR, STATIC_ROOT)
 WEB_GENERATED_DIR = join(CONFIG_DIR, GENERATED_ROOT)
 
 _ENV_OVERRIDES: set[str] = set()
@@ -172,9 +193,20 @@ def _refresh_path_constants() -> None:
     DATABASE_PATH = join(VAR_ROOT, 'db', 'trmnl.db')
     LOGS_DIR = join(VAR_ROOT, 'logs')
     SSL_DIR = join(VAR_ROOT, 'ssl')
-    WEB_ROOT_DIR = join(CONFIG_DIR, ASSETS_ROOT)
-    WEB_STATIC_DIR = join(CONFIG_DIR, STATIC_ROOT)
-    WEB_GENERATED_DIR = join(CONFIG_DIR, GENERATED_ROOT)
+    WEB_ROOT_DIR = _PINNED_WEB_STATIC_DIR or join(CONFIG_DIR, ASSETS_ROOT)
+    WEB_STATIC_DIR = _PINNED_WEB_STATIC_DIR or join(CONFIG_DIR, STATIC_ROOT)
+    WEB_GENERATED_DIR = _PINNED_WEB_GENERATED_DIR or join(CONFIG_DIR, GENERATED_ROOT)
+
+
+def pin_generated_assets_dir(path: str) -> None:
+    """Point the generated-asset root (served at /generated) at `path`.
+
+    Called once from `create_app()` with `<TRMNL_STATE_DIR>/generated`, the
+    one directory the unit is guaranteed to be able to write to.
+    """
+    global _PINNED_WEB_GENERATED_DIR
+    _PINNED_WEB_GENERATED_DIR = abspath(path)
+    _refresh_path_constants()
 
 
 def load_config(base_dir: str | None = None) -> None:
@@ -355,6 +387,19 @@ def panel_config() -> Config:
     if _PANEL is None:
         _PANEL = Config()
     return _PANEL
+
+
+def set_panel_config(cfg: Config) -> None:
+    """Install `cfg` as the process-wide panel config.
+
+    The plugin scheduler runs on a background task with no request context,
+    so the Garmin screen adapter has to reach the same Config the HTTP
+    surface was built with. `create_app()` calls this before anything else
+    so `panel_config()` is that object everywhere, rather than a second
+    instance re-read from the environment.
+    """
+    global _PANEL
+    _PANEL = cfg
 
 
 # models.py builds its SQLAlchemy engine at import time, so the database
