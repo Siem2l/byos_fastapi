@@ -279,7 +279,15 @@ def get_available_dither_modes() -> Tuple[str, ...]:
 
 
 def path_to_web_url(path: str, prefix: str = '/web') -> Optional[str]:
-    """Convert a filesystem path into the correct static or generated URL."""
+    """Convert a filesystem path into the correct static or generated URL.
+
+    Both sides are resolved before comparison. Resolving only the candidate
+    (as this did) makes the match fail whenever any component of the root is
+    a symlink — `/tmp` on macOS is the everyday case — and the failure is
+    silent: `url_png`/`url_bmp` come back None, the UI loses every thumbnail,
+    and `state._rotation_entry_id()` degrades to `"<Plugin>:None|None"`,
+    which then becomes the persisted playlist ID.
+    """
     candidate = Path(path)
     try:
         candidate = candidate.resolve()
@@ -292,12 +300,21 @@ def path_to_web_url(path: str, prefix: str = '/web') -> Optional[str]:
         (get_assets_root(), prefix)
     )
     for root, base in lookups:
-        try:
-            relative = candidate.relative_to(root)
+        for resolved_root in _root_candidates(root):
+            try:
+                relative = candidate.relative_to(resolved_root)
+            except ValueError:
+                continue
             return f"{base}/{relative.as_posix()}"
-        except ValueError:
-            continue
     return None
+
+
+def _root_candidates(root: Path) -> Tuple[Path, ...]:
+    try:
+        resolved = root.resolve()
+    except OSError:
+        return (root,)
+    return (root,) if resolved == root else (root, resolved)
 
 
 def resolve_dither_mode(mode: Optional[str]) -> str:

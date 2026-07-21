@@ -41,7 +41,7 @@ def _prepare_runtime(cfg: Config) -> None:
     # enough — but it must happen before services.state is imported, since
     # the rotation playlists are loaded out of it at startup.
     if not os.environ.get("TRMNL_DB_PATH"):
-        config.DATABASE_PATH = os.path.join(cfg.state_dir, "trmnl.db")
+        config.pin_database_path(os.path.join(cfg.state_dir, "trmnl.db"))
     models.init_db()
 
 
