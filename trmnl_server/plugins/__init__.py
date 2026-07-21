@@ -1,3 +1,0 @@
-"""
-Plugins package for trmnlServer.
-"""

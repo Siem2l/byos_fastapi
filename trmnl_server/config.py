@@ -266,3 +266,99 @@ def apply_persisted_config(entries: dict[str, str]) -> None:
 
 _apply_environment_overrides()
 _refresh_path_constants()
+
+
+# ---------------------------------------------------------------------------
+# Panel (BYOS) configuration.
+#
+# Entirely env-var driven: the NixOS module is the only intended writer of
+# these variables, and the names are load-bearing — modules/services/web/
+# trmnl.nix sets them verbatim. The defaults exist so `preview` works from a
+# source checkout.
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass, field  # noqa: E402
+
+
+def _env_list(name: str, default: list[str]) -> list[str]:
+    raw = environ.get(name, '')
+    items = [p.strip() for p in raw.split(',') if p.strip()]
+    return items or default
+
+
+def normalise_mac(value: str) -> str:
+    """Lowercase, strip separators — the firmware's casing is not stable."""
+    return ''.join(c for c in value.lower() if c.isalnum())
+
+
+@dataclass
+class Config:
+    host: str = field(default_factory=lambda: environ.get(
+        'TRMNL_HOST', '127.0.0.1'))
+    port: int = field(default_factory=lambda: _env_int(
+        'TRMNL_PORT', 8095, 'trmnl_port'))
+    # Where rendered BMPs are written and served from.
+    state_dir: str = field(default_factory=lambda: environ.get(
+        'TRMNL_STATE_DIR', '/var/lib/trmnl'))
+    garmin_db_dir: str = field(default_factory=lambda: environ.get(
+        'TRMNL_GARMIN_DB_DIR', '/mnt/storage/garmin/DBs'))
+    # Playlist: screens are served round-robin in this order.
+    playlist: list[str] = field(default_factory=lambda: _env_list(
+        'TRMNL_PLAYLIST', ['readiness']))
+    width: int = field(default_factory=lambda: _env_int(
+        'TRMNL_WIDTH', 800, 'trmnl_width'))
+    height: int = field(default_factory=lambda: _env_int(
+        'TRMNL_HEIGHT', 480, 'trmnl_height'))
+    # Shared secret the device echoes back in the Access-Token header.
+    # Read from a file so it never appears in the systemd unit or /proc.
+    token_file: str = field(default_factory=lambda: environ.get(
+        'TRMNL_TOKEN_FILE', ''))
+    # MAC addresses permitted to enrol. /api/setup necessarily predates the
+    # device holding a token, so on a publicly-reachable deployment this
+    # allowlist is the only thing standing between a passer-by and a free
+    # copy of the access token.
+    allowed_devices: list[str] = field(default_factory=lambda: [
+        normalise_mac(m) for m in _env_list('TRMNL_ALLOWED_DEVICES', [])
+    ])
+    # Public base URL, needed because /api/display hands the firmware an
+    # absolute image_url rather than a relative path.
+    base_url: str = field(default_factory=lambda: environ.get(
+        'TRMNL_BASE_URL', '').rstrip('/'))
+
+    # Serve fabricated data instead of reading GarminDB. Lets the unit be
+    # smoke-tested on a host where the import has not run yet.
+    synthetic: bool = field(default_factory=lambda: bool(
+        environ.get('TRMNL_SYNTHETIC')))
+
+    def device_allowed(self, device_id: str | None) -> bool:
+        """An empty allowlist means "any device", which is LAN-only sane."""
+        if not self.allowed_devices:
+            return True
+        return normalise_mac(device_id or '') in self.allowed_devices
+
+    def token(self) -> str | None:
+        if not self.token_file:
+            return None
+        try:
+            with open(self.token_file, encoding='utf-8') as fh:
+                return fh.read().strip() or None
+        except OSError:
+            return None
+
+
+_PANEL: 'Config | None' = None
+
+
+def panel_config() -> Config:
+    """The process-wide panel config, built from the environment on first use."""
+    global _PANEL
+    if _PANEL is None:
+        _PANEL = Config()
+    return _PANEL
+
+
+# models.py builds its SQLAlchemy engine at import time, so the database
+# location has to be pinned via the environment before the process starts.
+_db_override = environ.get('TRMNL_DB_PATH')
+if _db_override:
+    DATABASE_PATH = _db_override

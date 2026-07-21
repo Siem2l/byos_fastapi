@@ -1,7 +1,5 @@
-"""FastAPI routers for the TRMNL local server."""
+"""FastAPI routers for the TRMNL BYOS panel server."""
 
-from .api import router as api_router
-from .images import router as image_router
-from .pages import router as page_router
+from .panel import router as panel_router
 
-__all__ = ['api_router', 'image_router', 'page_router']
+__all__ = ['panel_router']
