@@ -375,6 +375,13 @@ class Config:
     # Read from a file so it never appears in the systemd unit or /proc.
     token_file: str = field(default_factory=lambda: environ.get(
         'TRMNL_TOKEN_FILE', ''))
+    # Shared secret for the *browser* control plane (routes/auth.py). This is
+    # deliberately a second, independent secret: a leak of the panel's
+    # Access-Token must not become a control-plane write, and a leak of the
+    # UI secret must not let anyone impersonate the panel. Never accept one
+    # where the other is expected.
+    ui_token_file: str = field(default_factory=lambda: environ.get(
+        'TRMNL_UI_TOKEN_FILE', ''))
     # MAC addresses permitted to enrol. /api/setup necessarily predates the
     # device holding a token, so on a publicly-reachable deployment this
     # allowlist is the only thing standing between a passer-by and a free
@@ -403,6 +410,21 @@ class Config:
             return None
         try:
             with open(self.token_file, encoding='utf-8') as fh:
+                return fh.read().strip() or None
+        except OSError:
+            return None
+
+    def ui_token(self) -> str | None:
+        """Secret that mints a control-plane session cookie.
+
+        Read on every use rather than cached, so rotating the file
+        invalidates every outstanding session at the next request without a
+        restart (the cookie's HMAC key is derived from this value).
+        """
+        if not self.ui_token_file:
+            return None
+        try:
+            with open(self.ui_token_file, encoding='utf-8') as fh:
                 return fh.read().strip() or None
         except OSError:
             return None

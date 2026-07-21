@@ -253,3 +253,15 @@ body {
 		}
 		@media (max-width: 480px) { .menu a { text-align: center; float: none; } }
 	
+
+		/* Control-plane login (routes/auth.py). Rendered over the shell
+		   rather than instead of it, so the tab chrome stays put and the
+		   dashboard is simply inert until a session exists. */
+		.login-overlay { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: center; justify-content: center; background: rgba(15, 23, 42, 0.55); backdrop-filter: blur(3px); }
+		.login-card { width: min(400px, calc(100vw - 32px)); display: flex; flex-direction: column; gap: 12px; padding: 24px; border-radius: 10px; border: 1px solid var(--color-card-border); background: var(--color-card-bg); color: var(--color-text); box-shadow: 0 18px 48px rgba(15, 23, 42, 0.35); }
+		.login-card h2 { margin: 0; font-size: 1.1rem; }
+		.login-card p { margin: 0; font-size: 0.85rem; color: var(--color-muted); line-height: 1.45; }
+		.login-card input { padding: 8px 10px; border-radius: 6px; border: 1px solid var(--color-border); background: var(--color-bg); color: var(--color-text); font-size: 0.9rem; }
+		.login-card button { padding: 8px 14px; border-radius: 6px; border: none; background: var(--color-accent); color: #fff; font-size: 0.9rem; cursor: pointer; }
+		.login-card button:disabled { opacity: 0.5; cursor: default; }
+		.login-error { font-size: 0.8rem; color: #d64545; }

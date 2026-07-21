@@ -13,7 +13,18 @@ Everything that remains is browser-facing and lives *outside* the `/api/`
 namespace, which is load-bearing: the Pangolin edge config bypasses SSO for
 `/api/*` and `/image/*` precisely because the ESP32 cannot follow an SSO
 redirect. Do not move a browser endpoint under `/api/` — it would silently
-lose its Authentik gate.
+lose its Authentik gate. That is no longer a convention held up by this
+comment: `main.py::_assert_route_invariants()` refuses to build the app if
+any route outside the firmware's fixed device surface appears under `/api/`.
+
+Authorisation is attached to the *router*, not to individual routes — see
+`routes/auth.py` for why the edge's SSO cannot be relied on alone (it
+forwards no identity, and the backend cannot distinguish an SSO'd request
+from a bypassed one). Every route below therefore requires an app-owned
+session cookie, and every mutating one additionally requires a same-origin
+request. Routes added to this router inherit both automatically; nobody has
+to remember a decorator. None of these is a "safe read": `/server/log` and
+`/status` both carry frame-preview capabilities.
 
 `/settings`, `/settings/refreshtime` and `/settings/imagepath` are also gone:
 this fork is env-var driven (the NixOS module owns every knob) and never
@@ -28,19 +39,28 @@ from os import cpu_count, getloadavg
 from typing import Any, Dict, Optional
 
 from time import time
-from fastapi import APIRouter, Body, Query, Request
+from fastapi import APIRouter, Body, Depends, Query, Request
 from fastapi.responses import JSONResponse, Response
 
 from .. import config, models, utils
 from ..services import state
+from .auth import require_ui_session
 
 try:  # pragma: no cover - exercised by which wheel happens to be installed
     import psutil
 except ImportError:  # pragma: no cover
     psutil = None
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_ui_session)])
 logger = config.logger
+
+# What a device's refresh interval may be set to, in seconds. `/api/display`
+# applies this value verbatim, so it is a write into physical hardware
+# behaviour: 1 s would flatten the battery in hours, 86400 s would freeze the
+# display for a day. Auth is the gate; this clamp is the blast radius, and it
+# holds even for a caller holding a valid session.
+MIN_REFRESH_INTERVAL = 60
+MAX_REFRESH_INTERVAL = 21600
 
 
 def _cpu_load_percent() -> float:
@@ -204,8 +224,20 @@ def update_device(
 
     refresh_override: Optional[int] = None
     if refresh_interval is not None:
-        if not isinstance(refresh_interval, int) or refresh_interval <= 0:
+        # bool is an int subclass; `True` must not become a 1-second poll.
+        if isinstance(refresh_interval, bool) or not isinstance(refresh_interval, int) or refresh_interval <= 0:
             return JSONResponse({'status': 'error', 'message': 'refresh_interval must be a positive integer'}, status_code=400)
+        if not MIN_REFRESH_INTERVAL <= refresh_interval <= MAX_REFRESH_INTERVAL:
+            return JSONResponse(
+                {
+                    'status': 'error',
+                    'message': (
+                        'refresh_interval must be between '
+                        f'{MIN_REFRESH_INTERVAL} and {MAX_REFRESH_INTERVAL} seconds'
+                    ),
+                },
+                status_code=400,
+            )
         refresh_override = refresh_interval
 
     if playlist_ids is not None:

@@ -18,7 +18,13 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config, models
 from .config import Config
-from .routes import api_router, image_router, page_router, panel_router
+from .routes import (
+    api_router,
+    auth_router,
+    image_router,
+    page_router,
+    panel_router,
+)
 from .routes.panel import configure
 from .screens import available
 
@@ -118,10 +124,26 @@ def create_app(cfg: Config) -> FastAPI:
     # load-bearing rather than cosmetic.
     app.include_router(panel_router)
     app.include_router(api_router)
+    app.include_router(auth_router)
     app.include_router(image_router)
     app.include_router(page_router)
     _mount_static(app)
 
+    # No CORSMiddleware, and its absence is load-bearing rather than an
+    # omission: FastAPI only parses a body as JSON when the content-type says
+    # so, which 422s a `text/plain` simple-request forgery, and PATCH/DELETE
+    # are preflighted into oblivion with no Access-Control-Allow-Origin
+    # header. Adding CORS would hand cross-site JS the control plane that
+    # SameSite=Strict and the origin pin exist to deny it.
+    # tests/test_panel.py::test_no_cors_middleware_is_installed asserts it is
+    # still absent.
+
+    if not cfg.ui_token_file:
+        logger.error(
+            "TRMNL_UI_TOKEN_FILE is unset — the browser control plane "
+            "(/rotation, /devices, /status, /server/*) will refuse every "
+            "request with 503. Point it at a file holding the UI secret."
+        )
     return app
 
 
