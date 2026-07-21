@@ -225,26 +225,62 @@ LOG_ROW_CAP = 5000
 # back to the cap in one statement.
 _LOG_TRIM_SLACK = 500
 
+# Two retention classes, because one FIFO is not enough.
+#
+# `/api/setup` writes the enrolment record: the single line saying a MAC was
+# handed the access token, and the only in-app trace of it — the full MAC
+# goes to the journal, but the *fact of an enrolment* is what an operator
+# scans this table for. `POST /api/log` is unauthenticated by necessity and
+# internet-reachable, so under a single oldest-first cap a flood of device
+# chatter evicts exactly those rows: the attacker who steals a token by
+# enrolling also erases the evidence, using a second endpoint that needs no
+# credential at all. Protected rows are therefore never deleted to make room
+# for unprotected ones. They get their own, much smaller cap, trimmed
+# against themselves — bounded, but only by other enrolments, which require
+# passing the MAC allowlist.
+PROTECTED_LOG_CONTEXTS = frozenset({"/api/setup"})
+LOG_PROTECTED_ROW_CAP = 500
+
 _log_rows_since_trim = 0
 
 
-def _trim_logs(db: Session) -> None:
-    """Evict oldest-first so the table cannot exceed LOG_ROW_CAP + slack."""
-    total = db.execute(select(func.count()).select_from(LogEntry)).scalar_one()
-    if total <= LOG_ROW_CAP + _LOG_TRIM_SLACK:
+def _protected_filter(protected: bool):
+    contexts = tuple(sorted(PROTECTED_LOG_CONTEXTS))
+    if protected:
+        return LogEntry.context.in_(contexts)
+    return LogEntry.context.notin_(contexts)
+
+
+def _trim_log_class(db: Session, *, protected: bool, cap: int, slack: int) -> None:
+    """Evict oldest-first within one retention class, never across classes."""
+    where = _protected_filter(protected)
+    total = db.execute(
+        select(func.count()).select_from(LogEntry).where(where)
+    ).scalar_one()
+    if total <= cap + slack:
         return
     # id is the monotonic insertion order; timestamp is not unique enough to
     # order by on its own under a burst.
     cutoff = db.execute(
         select(LogEntry.id)
+        .where(where)
         .order_by(LogEntry.id.desc())
-        .offset(LOG_ROW_CAP - 1)
+        .offset(cap - 1)
         .limit(1)
     ).scalar_one_or_none()
     if cutoff is None:
         return
-    db.execute(delete(LogEntry).where(LogEntry.id < cutoff))
-    logger.info("trimmed logs table to %s rows", LOG_ROW_CAP)
+    db.execute(delete(LogEntry).where(where).where(LogEntry.id < cutoff))
+    logger.info(
+        "trimmed %s logs to %s rows",
+        "protected" if protected else "device", cap,
+    )
+
+
+def _trim_logs(db: Session) -> None:
+    """Enforce both caps. Device chatter can never evict an enrolment."""
+    _trim_log_class(db, protected=False, cap=LOG_ROW_CAP, slack=_LOG_TRIM_SLACK)
+    _trim_log_class(db, protected=True, cap=LOG_PROTECTED_ROW_CAP, slack=0)
 
 
 def trim_logs() -> None:

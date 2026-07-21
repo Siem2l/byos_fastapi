@@ -58,6 +58,17 @@ def _reset_process_state() -> None:
         # is still in memory for the next one, whose DB has never seen it.
         state_module.global_state['device_profiles'] = {}
 
+    # The rate limiters are module-global sliding windows, so without this
+    # the suite's own traffic accumulates across the ~30 apps it builds and
+    # a later test gets a 429 for something an earlier test did.
+    from trmnl_server.routes import auth as auth_module
+    from trmnl_server.routes import panel as panel_module
+
+    panel_module._log_buckets.clear()
+    panel_module._log_global_hits.clear()
+    auth_module._mint_failures.clear()
+    auth_module._mint_global_failures.clear()
+
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
@@ -766,6 +777,88 @@ def test_no_token_file_configured_still_means_no_token_required(client):
         assert client.get("/preview/readiness.png").status_code == 200
     finally:
         cfg.token_file = original
+
+
+# --- E: the log flood is bounded, and enrolment survives it ---------------
+
+
+def test_rotating_the_id_header_does_not_bypass_the_log_limit(client):
+    from trmnl_server.routes import panel as panel_routes
+
+    panel_routes._log_buckets.clear()
+    panel_routes._log_global_hits.clear()
+
+    accepted = 0
+    attempts = panel_routes._LOG_GLOBAL_RATE_LIMIT * 3
+    for i in range(attempts):
+        # A fresh, never-seen device ID per request: the per-source window
+        # can never fire, which is exactly the bypass.
+        resp = client.post(
+            "/api/log", content=b"flood", headers={"ID": f"AA:BB:CC:DD:{i:02X}:{i % 256:02X}"}
+        )
+        if resp.status_code == 204:
+            accepted += 1
+        else:
+            assert resp.status_code == 429
+    assert accepted == panel_routes._LOG_GLOBAL_RATE_LIMIT, accepted
+    assert accepted < attempts
+    panel_routes._log_buckets.clear()
+    panel_routes._log_global_hits.clear()
+
+
+def test_omitting_the_id_header_does_not_bypass_the_log_limit(client):
+    from trmnl_server.routes import panel as panel_routes
+
+    panel_routes._log_buckets.clear()
+    panel_routes._log_global_hits.clear()
+    accepted = sum(
+        client.post("/api/log", content=b"flood").status_code == 204
+        for _ in range(panel_routes._LOG_RATE_LIMIT * 4)
+    )
+    assert accepted == panel_routes._LOG_RATE_LIMIT
+    panel_routes._log_buckets.clear()
+    panel_routes._log_global_hits.clear()
+
+
+def test_enrolment_entries_survive_a_device_log_flood(client, monkeypatch):
+    """The attacker who enrols must not be able to erase the record of it.
+
+    `/api/setup` writes the only in-app trace that a MAC was handed the
+    access token, and `/api/log` needs no credential at all. Under one
+    oldest-first cap, a flood on the second endpoint evicts the first.
+    """
+    monkeypatch.setattr(models, "LOG_ROW_CAP", 40)
+    monkeypatch.setattr(models, "_LOG_TRIM_SLACK", 10)
+
+    resp = client.get("/api/setup", headers={"ID": MAC})
+    assert resp.status_code == 200
+
+    for i in range(500):
+        models.add_log_entry("device log", f"flood {i}")
+
+    entries = models.get_logs(limit=200)
+    contexts = [entry.context for entry in entries]
+    assert "/api/setup" in contexts, contexts[:5]
+    # ...and the flood itself is still capped.
+    device_rows = [c for c in contexts if c != "/api/setup"]
+    assert len(device_rows) <= 40 + 10
+
+
+def test_protected_log_rows_are_themselves_capped(client, monkeypatch):
+    """The reserved class must not become its own unbounded table."""
+    monkeypatch.setattr(models, "LOG_PROTECTED_ROW_CAP", 20)
+    for i in range(200):
+        models.add_log_entry("/api/setup", f"enrolled device {i:04X}")
+    models.trim_logs()
+    with models.SessionLocal() as db:
+        from sqlalchemy import func, select as sa_select
+
+        total = db.execute(
+            sa_select(func.count())
+            .select_from(models.LogEntry)
+            .where(models.LogEntry.context == "/api/setup")
+        ).scalar_one()
+    assert total <= 20
 
 
 # --- F: /generated is gated exactly like /preview -------------------------
