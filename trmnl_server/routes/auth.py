@@ -43,6 +43,7 @@ import base64
 import hashlib
 import hmac
 import secrets
+import threading
 import time
 from typing import Any, Dict
 
@@ -66,6 +67,76 @@ _KEY_CONTEXT = b"trmnl-ui-session-v1"
 
 # Methods that cannot change state, and so do not need the origin check.
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+# --- POST /auth/session throttling ----------------------------------------
+#
+# This route is an unauthenticated oracle for the UI secret. It is nominally
+# behind Authentik, but the premise of this whole module is that the app
+# cannot tell an SSO'd request from a bypassed one, so it is bounded as
+# though it were exposed. Only *failures* are counted, and a success clears
+# the caller's counter: an operator who fat-fingers the secret once and then
+# gets it right is never locked out by their own successful login, while a
+# guesser gets ten tries per five minutes and no more.
+_MINT_RATE_WINDOW = 300.0        # seconds
+_MINT_FAIL_LIMIT = 10            # failed attempts per window per client
+_MINT_GLOBAL_FAIL_LIMIT = 100    # failed attempts per window, all clients
+_MINT_MAX_SOURCES = 512          # distinct clients tracked, to bound the dict
+_mint_failures: dict[str, list[float]] = {}
+_mint_global_failures: list[float] = []
+_mint_lock = threading.Lock()
+
+
+def _mint_source(request: Request) -> str:
+    """Client address, or a single shared bucket when there is none.
+
+    Behind Pangolin every request arrives from the Newt tunnel, so in
+    production this is frequently one address for everyone — which is why
+    the global counter exists and is not merely a backstop.
+    """
+    client = request.client
+    return client.host if client and client.host else "unknown"
+
+
+def _mint_allowed(source: str) -> bool:
+    """False once this client, or the server as a whole, is over its budget."""
+    now = time.monotonic()
+    cutoff = now - _MINT_RATE_WINDOW
+    with _mint_lock:
+        hits = [t for t in _mint_failures.get(source, []) if t >= cutoff]
+        if hits:
+            _mint_failures[source] = hits
+        else:
+            _mint_failures.pop(source, None)
+        if len(hits) >= _MINT_FAIL_LIMIT:
+            return False
+        global _mint_global_failures
+        _mint_global_failures = [t for t in _mint_global_failures if t >= cutoff]
+        return len(_mint_global_failures) < _MINT_GLOBAL_FAIL_LIMIT
+
+
+def _mint_record_failure(source: str) -> None:
+    now = time.monotonic()
+    cutoff = now - _MINT_RATE_WINDOW
+    with _mint_lock:
+        if len(_mint_failures) > _MINT_MAX_SOURCES:
+            for key in [
+                k for k, v in _mint_failures.items() if not v or v[-1] < cutoff
+            ]:
+                del _mint_failures[key]
+            if len(_mint_failures) > _MINT_MAX_SOURCES:
+                _mint_failures.clear()
+        hits = [t for t in _mint_failures.get(source, []) if t >= cutoff]
+        hits.append(now)
+        _mint_failures[source] = hits
+        global _mint_global_failures
+        _mint_global_failures = [t for t in _mint_global_failures if t >= cutoff]
+        _mint_global_failures.append(now)
+
+
+def _mint_clear(source: str) -> None:
+    """A correct secret proves the caller is not the guesser being throttled."""
+    with _mint_lock:
+        _mint_failures.pop(source, None)
 
 
 def _b64(raw: bytes) -> str:
@@ -143,12 +214,21 @@ def _same_origin(request: Request) -> bool:
         # client). Browsers always send Origin on cross-origin state-changing
         # requests, so absence cannot be a cross-site forgery.
         return True
-    allowed = {(panel_config().base_url or "").rstrip("/")}
-    allowed.discard("")
-    # The URL the request actually arrived on, so a deployment that has not
-    # set TRMNL_BASE_URL is still usable from its own origin.
-    allowed.add(str(request.base_url).rstrip("/"))
-    return origin in allowed
+    configured = (panel_config().base_url or "").rstrip("/")
+    if configured:
+        # Pin to the configured origin and *only* that. `request.base_url` is
+        # built from the Host header, which the client supplies: accepting it
+        # meant the rule was "Origin must match a value the caller also
+        # controls", which any request that can set both headers satisfies —
+        # a rebound DNS name, a misconfigured upstream that forwards Host
+        # verbatim, a proxy honouring X-Forwarded-Host. TRMNL_BASE_URL is set
+        # by the NixOS module and is the one origin this deployment has.
+        return origin == configured
+    # No TRMNL_BASE_URL: a source checkout or a LAN box with no fixed name,
+    # where there is nothing to pin to but the URL the request arrived on.
+    # Weaker by necessity, and the reason the module logs at startup when
+    # base_url is unset.
+    return origin == str(request.base_url).rstrip("/")
 
 
 def require_ui_session(request: Request) -> None:
@@ -201,6 +281,10 @@ def create_session(
     secret = panel_config().ui_token()
     if not secret:
         return Response(status_code=503)
+    source = _mint_source(request)
+    if not _mint_allowed(source):
+        logger.warning("session mint throttled for %s", source)
+        return Response(status_code=429)
     supplied = request.headers.get("X-TRMNL-UI-Token") or ""
     if not supplied and isinstance(data, dict):
         candidate = data.get("token")
@@ -210,14 +294,26 @@ def create_session(
     # wrong one take the same path — and a non-ASCII one is a 401, not the
     # 500 `hmac.compare_digest` would raise on it.
     if not secret_equal(supplied.strip(), secret):
+        _mint_record_failure(source)
         return Response(status_code=401)
+    _mint_clear(source)
     response = Response(status_code=204)
     _set_cookie(response, mint_session(secret))
     return response
 
 
 @router.delete("/auth/session")
-def destroy_session() -> Response:
+def destroy_session(request: Request) -> Response:
+    """Clear the session cookie.
+
+    Origin-pinned like every other mutating route: without it, any page on
+    the internet could log the operator out of their own dashboard on a
+    loop. Deliberately *not* session-gated — clearing a cookie you may no
+    longer hold a valid version of has to stay idempotent, or a browser
+    holding an expired or rotated cookie could never get rid of it.
+    """
+    if not _same_origin(request):
+        raise HTTPException(status_code=403, detail="cross-origin request refused")
     response = Response(status_code=204)
     response.delete_cookie(COOKIE_NAME, path="/")
     return response
