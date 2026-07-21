@@ -520,3 +520,68 @@ def test_secret_equal_never_raises():
     # A lone surrogate: what a JSON body can decode to, and what plain
     # utf-8 encoding refuses.
     assert secret_equal("\ud800", "a") is False
+
+
+# --- D: an unreadable token file fails CLOSED ----------------------------
+
+
+def test_unreadable_token_file_denies_instead_of_opening_up(client, tmp_path):
+    """"Configured but unreadable" is a fault, not "no token required"."""
+    from trmnl_server.config import panel_config
+
+    token_path = Path(panel_config().token_file)
+    assert client.get(
+        "/api/display", headers={"ID": MAC, "Access-Token": TOKEN}
+    ).status_code == 200
+
+    token_path.chmod(0o000)
+    try:
+        if os.access(token_path, os.R_OK):  # pragma: no cover - running as root
+            pytest.skip("cannot make a file unreadable as this user")
+        assert client.get(
+            "/api/display", headers={"ID": MAC, "Access-Token": TOKEN}
+        ).status_code == 401
+        assert client.get("/api/display", headers={"ID": MAC}).status_code == 401
+        assert client.get(
+            "/preview/readiness.png", headers={"Access-Token": TOKEN}
+        ).status_code == 401
+        # Enrolment cannot hand out a token it cannot read, and must not
+        # hand out an empty one.
+        setup = client.get("/api/setup", headers={"ID": MAC})
+        assert setup.status_code == 503
+    finally:
+        token_path.chmod(0o600)
+
+    assert client.get(
+        "/api/display", headers={"ID": MAC, "Access-Token": TOKEN}
+    ).status_code == 200
+
+
+def test_empty_token_file_fails_closed(client):
+    from trmnl_server.config import panel_config
+
+    token_path = Path(panel_config().token_file)
+    token_path.write_text("   \n")
+    try:
+        assert client.get(
+            "/api/display", headers={"ID": MAC, "Access-Token": ""}
+        ).status_code == 401
+        assert client.get("/api/setup", headers={"ID": MAC}).status_code == 503
+    finally:
+        token_path.write_text(TOKEN)
+
+
+def test_no_token_file_configured_still_means_no_token_required(client):
+    """The LAN-only deployment shape must keep working."""
+    from trmnl_server.config import panel_config
+
+    cfg = panel_config()
+    original = cfg.token_file
+    cfg.token_file = ""
+    try:
+        assert client.get(
+            "/api/display", headers={"ID": MAC}
+        ).status_code == 200
+        assert client.get("/preview/readiness.png").status_code == 200
+    finally:
+        cfg.token_file = original

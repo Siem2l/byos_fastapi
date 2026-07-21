@@ -353,6 +353,16 @@ def normalise_mac(value: str) -> str:
     return ''.join(c for c in value.lower() if c.isalnum())
 
 
+class TokenUnavailable(RuntimeError):
+    """A secret file is configured but its contents could not be read.
+
+    Distinct from "no secret configured", which is a deployment choice
+    (LAN-only) and means the check is skipped. This one is an operational
+    fault — a bad mode, a missing bind mount, a truncated file — and callers
+    must fail closed on it. See `Config.token()`.
+    """
+
+
 @dataclass
 class Config:
     host: str = field(default_factory=lambda: environ.get(
@@ -406,13 +416,34 @@ class Config:
         return normalise_mac(device_id or '') in self.allowed_devices
 
     def token(self) -> str | None:
+        """The panel's Access-Token, or None when none is configured.
+
+        Two different "no token" cases, and conflating them is a fail-open.
+        `TRMNL_TOKEN_FILE` unset is a deployment *decision* — LAN-only, no
+        token required — and `routes/panel.py::authorised()` treats it as
+        "the check does not apply". A configured file that cannot be read,
+        or that is empty, is an operational *fault*: a bad mode, a missing
+        bind mount, a truncated write, a `chmod 000`. Returning None there
+        would silently drop the Access-Token requirement from /api/display,
+        /preview and /generated on a deployment that asked for one — on the
+        open internet, since /api/* bypasses the edge's SSO. So this raises
+        instead, and every caller fails closed on it.
+        """
         if not self.token_file:
             return None
         try:
             with open(self.token_file, encoding='utf-8') as fh:
-                return fh.read().strip() or None
-        except OSError:
-            return None
+                value = fh.read().strip()
+        except OSError as exc:
+            raise TokenUnavailable(
+                f'TRMNL_TOKEN_FILE {self.token_file!r} is configured but '
+                f'could not be read: {exc}'
+            ) from exc
+        if not value:
+            raise TokenUnavailable(
+                f'TRMNL_TOKEN_FILE {self.token_file!r} is configured but empty'
+            )
+        return value
 
     def ui_token(self) -> str | None:
         """Secret that mints a control-plane session cookie.
@@ -420,14 +451,31 @@ class Config:
         Read on every use rather than cached, so rotating the file
         invalidates every outstanding session at the next request without a
         restart (the cookie's HMAC key is derived from this value).
+
+        Unlike `token()` this returns None on an unreadable file rather than
+        raising, because None is *already* fail-closed here:
+        `require_ui_session()` refuses the whole control plane with 503 when
+        there is no secret, and `create_session()` will not mint a cookie
+        without one. The error is logged so the cause is not a mystery.
         """
         if not self.ui_token_file:
             return None
         try:
             with open(self.ui_token_file, encoding='utf-8') as fh:
-                return fh.read().strip() or None
-        except OSError:
+                value = fh.read().strip()
+        except OSError as exc:
+            logger.error(
+                'TRMNL_UI_TOKEN_FILE %r could not be read (%s) — the control '
+                'plane will refuse every request', self.ui_token_file, exc
+            )
             return None
+        if not value:
+            logger.error(
+                'TRMNL_UI_TOKEN_FILE %r is empty — the control plane will '
+                'refuse every request', self.ui_token_file
+            )
+            return None
+        return value
 
 
 _PANEL: 'Config | None' = None

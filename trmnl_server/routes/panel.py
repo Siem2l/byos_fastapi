@@ -47,7 +47,7 @@ from fastapi.responses import JSONResponse, Response
 
 from .. import models
 from ..credentials import secret_equal
-from ..config import Config, normalise_mac, panel_config
+from ..config import Config, TokenUnavailable, normalise_mac, panel_config
 from ..plugins.garmin import SLUG_BY_PLUGIN
 from ..render import render_notice, render_screen
 from ..screens import available as available_screens
@@ -231,8 +231,20 @@ def _config() -> Config:
 
 
 def authorised(request: Request) -> bool:
-    """Access-Token header check. Also used by routes/images.py."""
-    expected = _config().token()
+    """Access-Token header check. Also used by routes/images.py.
+
+    Fails closed when a token file is configured but unreadable. That case
+    used to be indistinguishable from "no token configured" and therefore
+    *allowed* the request: one `chmod 000`, one bad bind mount, one
+    DynamicUser UID change and /api/display, /preview and /generated would
+    have served health data to anyone, on a deployment whose whole point was
+    that they do not.
+    """
+    try:
+        expected = _config().token()
+    except TokenUnavailable as exc:
+        logger.error("refusing request: %s", exc)
+        return False
     if not expected:
         return True
     supplied = request.headers.get("Access-Token") or ""
@@ -375,7 +387,18 @@ def api_setup(request: Request) -> JSONResponse:
         return JSONResponse(
             {"status": 403, "error": "unknown device"}, status_code=403
         )
-    token = cfg.token()
+    try:
+        token = cfg.token()
+    except TokenUnavailable as exc:
+        # Handing out `""` here would enrol the panel with no credential and
+        # leave it polling /api/display forever with a token that can never
+        # match. 503 is the honest answer: the fault is on this side, and the
+        # firmware retries.
+        logger.error("refusing enrolment: %s", exc)
+        return JSONResponse(
+            {"status": 503, "error": "access token unavailable"},
+            status_code=503,
+        )
     models.add_log_entry("/api/setup", f"enrolled device {_device_label(device)}")
     return JSONResponse({
         "status": 200,
