@@ -412,11 +412,13 @@ def test_generated_serves_current_rotation_members(ui_client):
     assert resp_bmp.headers["content-type"] == "image/bmp"
 
 
-def test_generated_refuses_anything_not_in_the_rotation(client):
-    assert client.get("/generated/garmin/nothing.png").status_code == 404
-    assert client.get("/generated/../trmnl.db").status_code == 404
-    assert client.get("/generated/trmnl.db").status_code == 404
-    assert client.get("/generated/garmin/readiness.png/../../trmnl.db").status_code == 404
+def test_generated_refuses_anything_not_in_the_rotation(ui_client):
+    assert ui_client.get("/generated/garmin/nothing.png").status_code == 404
+    assert ui_client.get("/generated/../trmnl.db").status_code == 404
+    assert ui_client.get("/generated/trmnl.db").status_code == 404
+    assert ui_client.get(
+        "/generated/garmin/readiness.png/../../trmnl.db"
+    ).status_code == 404
 
 
 # --- LATENT: nothing but the device surface may live under /api/ -----------
@@ -702,3 +704,34 @@ def test_no_token_file_configured_still_means_no_token_required(client):
         assert client.get("/preview/readiness.png").status_code == 200
     finally:
         cfg.token_file = original
+
+
+# --- F: /generated is gated exactly like /preview -------------------------
+
+
+def test_generated_requires_a_credential(client):
+    """Same render as /preview, so it takes the same credential."""
+    ui = client.post("/auth/session", json={"token": UI_TOKEN})
+    assert ui.status_code == 204
+    entries = client.get("/rotation").json()["entries"]
+    assert entries
+    url_png = entries[0]["url_png"]
+    url_bmp = entries[0]["url_bmp"]
+    assert client.get(url_png).status_code == 200
+
+    client.cookies.clear()
+    assert client.get(url_png).status_code == 401
+    assert client.get(url_bmp).status_code == 401
+    # ...and the panel's Access-Token works, as it does on /preview.
+    assert client.get(
+        url_png, headers={"Access-Token": TOKEN}
+    ).status_code == 200
+    assert client.get(
+        url_png, headers={"Access-Token": "wrong"}
+    ).status_code == 401
+
+
+def test_generated_does_not_leak_existence_to_anonymous_callers(client):
+    """401 before the path check, so 404-vs-401 is not an enumeration oracle."""
+    assert client.get("/generated/garmin/nothing.png").status_code == 401
+    assert client.get("/generated/trmnl.db").status_code == 401
