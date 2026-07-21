@@ -103,7 +103,17 @@ _LOG_MAX_STORED = 500         # characters actually persisted
 _LOG_RATE_WINDOW = 300.0      # seconds
 _LOG_RATE_LIMIT = 12          # accepted posts per window per source
 _LOG_RATE_MAX_SOURCES = 512   # distinct sources tracked, to bound the bucket
+# Accepted posts per window across every source, keyed on nothing. The
+# per-source window is keyed on the `ID` header the poster chooses, so it
+# bounds a cooperative firmware and nobody else: rotating `ID` mints a fresh
+# bucket on every request and the per-source limit never fires. This is the
+# bound that holds against that, precisely because there is no key to
+# rotate. Sized for a handful of panels reporting an outage at once (one
+# panel's own ceiling is _LOG_RATE_LIMIT = 12 per window), which is an order
+# of magnitude above anything a healthy deployment produces.
+_LOG_GLOBAL_RATE_LIMIT = 120
 _log_buckets: dict[str, list[float]] = {}
+_log_global_hits: list[float] = []
 _log_bucket_lock = threading.Lock()
 
 router = APIRouter()
@@ -519,14 +529,23 @@ def api_display(request: Request) -> JSONResponse:
 
 
 def _log_rate_ok(source: str) -> bool:
-    """Sliding-window limiter, keyed on the device ID the poster claims.
+    """Two sliding windows: one per claimed device ID, one for everybody.
 
-    The key is self-asserted, so this is not an authorisation control — it
-    bounds a cooperative firmware's chatter and forces a determined abuser to
-    rotate the ID header, which then hits `_LOG_RATE_MAX_SOURCES`. Combined
-    with the row cap in `models.add_log_entry()`, the worst case is bounded
-    write pressure on a table that can no longer grow.
+    The per-source key is self-asserted, so on its own it is not a control at
+    all — an abuser rotates the `ID` header and every request lands in a
+    fresh bucket that has never seen a hit. (`_LOG_RATE_MAX_SOURCES` bounds
+    the *dict*, not the request rate; evicting stale buckets is exactly what
+    a rotating caller wants.) It stays because it is the fair-share bound
+    between real panels: one chatty device cannot spend the whole budget.
+
+    The global window is the bound that actually holds against a flood,
+    because it has no key to rotate. Together with the row cap and the
+    protected retention class in `models`, an anonymous caller can neither
+    grow the table, nor drive unbounded write pressure on the filesystem
+    that holds trmnl.db and the rendered frames, nor evict the enrolment
+    audit trail.
     """
+    global _log_global_hits
     now = time.monotonic()
     cutoff = now - _LOG_RATE_WINDOW
     with _log_bucket_lock:
@@ -541,8 +560,14 @@ def _log_rate_ok(source: str) -> bool:
         if len(hits) >= _LOG_RATE_LIMIT:
             _log_buckets[source] = hits
             return False
+        # Checked after the per-source window so a caller who is already over
+        # their own limit does not also consume global budget.
+        _log_global_hits = [t for t in _log_global_hits if t >= cutoff]
+        if len(_log_global_hits) >= _LOG_GLOBAL_RATE_LIMIT:
+            return False
         hits.append(now)
         _log_buckets[source] = hits
+        _log_global_hits.append(now)
         return True
 
 
@@ -557,9 +582,12 @@ async def api_log(request: Request) -> Response:
     the edge, so this is an open write endpoint on the public internet. It
     persists to the same SQLite file that sits beside the rendered frames, so
     an unbounded version of this route is a filesystem-exhaustion primitive
-    that also evicts the enrolment audit trail. Three bounds, none of which
-    change the firmware's happy path: a body cap, a stored-text cap, and a
-    per-source rate limit. The table itself is capped in `models`.
+    that also evicts the enrolment audit trail. Four bounds, none of which
+    change the firmware's happy path: a body cap sized against a real 10-note
+    firmware batch, a stored-text cap, a per-source rate limit, and a global
+    rate limit that a caller rotating the `ID` header cannot step around. The
+    table itself is capped in `models`, where `/api/setup` rows sit in a
+    separate retention class so this endpoint cannot evict them.
     """
     declared = request.headers.get("content-length")
     if declared is not None:
