@@ -87,6 +87,44 @@
     playlists: []
   };
 
+  // Control-plane auth.
+  //
+  // The Pangolin edge puts Authentik in front of everything outside /api/*
+  // and /image/*, but it forwards no identity to the backend and the backend
+  // cannot tell an SSO'd request from a bypassed one, so the server also
+  // demands a session cookie of its own on /rotation, /devices, /status and
+  // /server/* (see routes/auth.py). The cookie is HttpOnly — this file can
+  // never read it, and the UI secret goes straight from the login input into
+  // the POST body and is never persisted anywhere.
+  const AUTH_EVENT = 'trmnl-auth-required';
+
+  function signalAuthRequired() {
+    if (typeof window !== 'undefined' && window.dispatchEvent) {
+      window.dispatchEvent(new CustomEvent(AUTH_EVENT));
+    }
+  }
+
+  // Every control-plane request goes through here so a session that expires
+  // mid-session surfaces the login form instead of a silently stale
+  // dashboard. Credentials are same-origin by default, which is what we
+  // want: no cross-origin consumer exists.
+  async function apiFetch(url, options) {
+    const res = await fetch(url, options);
+    if (res.status === 401 || res.status === 503) {
+      signalAuthRequired();
+    }
+    return res;
+  }
+
+  async function submitUiToken(token) {
+    const res = await fetch('/auth/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token })
+    });
+    return res.status === 204;
+  }
+
   function withCacheBuster(url, seed, fallbackToNow = true) {
     if (!url) {
       return url;
@@ -271,6 +309,7 @@
     const [logsLoading, setLogsLoading] = useState(false);
     const [logsError, setLogsError] = useState(null);
     const [rotationFeedback, setRotationFeedback] = useState('');
+    const [authRequired, setAuthRequired] = useState(false);
     const [theme, setTheme] = useState(() => {
       if (typeof window === 'undefined') {
         return 'light';
@@ -365,7 +404,7 @@
           params.set('device_id', targetDevice);
         }
         const query = params.toString();
-        const res = await fetch(withCacheBuster(query ? `/status?${query}` : '/status'));
+        const res = await apiFetch(withCacheBuster(query ? `/status?${query}` : '/status'));
         if (!res.ok) return;
         const data = await res.json();
         setStatus(data);
@@ -387,7 +426,7 @@
 
     const fetchDevices = useCallback(async () => {
       try {
-        const res = await fetch(withCacheBuster('/devices?include_default=false'));
+        const res = await apiFetch(withCacheBuster('/devices?include_default=false'));
         if (!res.ok) return;
         const data = await res.json();
         if (Array.isArray(data?.devices)) {
@@ -416,9 +455,37 @@
       return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
     }, []);
 
+    // Ask up front rather than waiting for the first control-plane 401, so a
+    // cold load shows the unlock form instead of an empty dashboard.
+    useEffect(() => {
+      let cancelled = false;
+      fetch('/auth/session', { headers: { Accept: 'application/json' } })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (!cancelled && data && !data.authenticated) {
+            setAuthRequired(true);
+          }
+        })
+        .catch(() => {});
+      const onAuthRequired = () => setAuthRequired(true);
+      window.addEventListener(AUTH_EVENT, onAuthRequired);
+      return () => {
+        cancelled = true;
+        window.removeEventListener(AUTH_EVENT, onAuthRequired);
+      };
+    }, []);
+
+    const handleUnlock = useCallback(async (token) => {
+      const ok = await submitUiToken(token);
+      if (ok) {
+        setAuthRequired(false);
+      }
+      return ok;
+    }, []);
+
     const fetchRotation = useCallback(async () => {
       try {
-        const res = await fetch(withCacheBuster('/rotation'));
+        const res = await apiFetch(withCacheBuster('/rotation'));
         if (!res.ok) return;
         const data = await res.json();
         setRotation(data);
@@ -433,7 +500,7 @@
           return false;
         }
         try {
-          const res = await fetch(withCacheBuster(`/devices/${deviceId}`), {
+          const res = await apiFetch(withCacheBuster(`/devices/${deviceId}`), {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
@@ -470,7 +537,7 @@
           if (!reset && lastLogIdRef.current != null) {
             params.set('after', String(lastLogIdRef.current));
           }
-          const res = await fetch(withCacheBuster(`/server/log?${params.toString()}`), {
+          const res = await apiFetch(withCacheBuster(`/server/log?${params.toString()}`), {
             cache: 'no-store',
             headers: { Accept: 'application/json' }
           });
@@ -654,7 +721,7 @@
           const isDefault = !targetId || targetId === 'default';
           const endpoint = isDefault ? '/rotation' : '/playlists';
           const payload = isDefault ? { playlist } : { name: targetId, playlist };
-          const res = await fetch(withCacheBuster(endpoint), {
+          const res = await apiFetch(withCacheBuster(endpoint), {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(payload)
@@ -700,7 +767,7 @@
         return true;
       }
       try {
-        const res = await fetch(withCacheBuster(`/playlists/${encodeURIComponent(target)}`), { method: 'DELETE' });
+        const res = await apiFetch(withCacheBuster(`/playlists/${encodeURIComponent(target)}`), { method: 'DELETE' });
         if (!res.ok) {
           throw new Error(`Status ${res.status}`);
         }
@@ -776,6 +843,7 @@
 
     return html`
       <div class="app-shell">
+        ${authRequired ? html`<${LoginOverlay} onUnlock=${handleUnlock} />` : null}
         <${Menu} activeTab=${activeTab} setActiveTab=${setActiveTab} />
         <${Topbar}
           status=${status}
@@ -1142,7 +1210,8 @@
                         <span>Refresh interval (seconds)</span>
                         <input
                           type="number"
-                          min="30"
+                          min="60"
+                          max="21600"
                           step="30"
                           value=${formValues.refresh_interval}
                           onInput=${(e) => handleInput('refresh_interval', e.target.value)}
@@ -1665,6 +1734,56 @@
     });
 
     return html`<div class="playlist-grid">${items}</div>`;
+  }
+
+  function LoginOverlay({ onUnlock }) {
+    const [token, setToken] = useState('');
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState('');
+
+    const submit = async (event) => {
+      event.preventDefault();
+      const value = token.trim();
+      if (!value || busy) {
+        return;
+      }
+      setBusy(true);
+      setError('');
+      const ok = await onUnlock(value);
+      setBusy(false);
+      if (ok) {
+        // Drop it from component state the instant it is exchanged for a
+        // cookie. It is never written to localStorage, sessionStorage or the
+        // URL — the only place it lives afterwards is the HttpOnly cookie,
+        // which this script cannot read.
+        setToken('');
+      } else {
+        setError('That token was not accepted');
+      }
+    };
+
+    return html`
+      <div class="login-overlay">
+        <form class="login-card" onSubmit=${submit}>
+          <h2>Unlock the dashboard</h2>
+          <p>
+            This server keeps its own session for the control plane, separate
+            from the panel's access token. Paste the UI token to continue.
+          </p>
+          <input
+            type="password"
+            autocomplete="off"
+            placeholder="UI token"
+            value=${token}
+            onInput=${(e) => setToken(e.target.value)}
+          />
+          ${error ? html`<div class="login-error">${error}</div>` : null}
+          <button type="submit" disabled=${busy || !token.trim()}>
+            ${busy ? 'Checking…' : 'Unlock'}
+          </button>
+        </form>
+      </div>
+    `;
   }
 
   function getWifiStrength(rssi) {

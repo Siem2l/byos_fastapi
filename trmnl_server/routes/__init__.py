@@ -10,7 +10,10 @@ the Access-Token check and the frame nonces live.
 
 from .panel import router as panel_router
 from .api import router as api_router
+from .auth import router as auth_router
 from .images import router as image_router
 from .pages import router as page_router
 
-__all__ = ['panel_router', 'api_router', 'image_router', 'page_router']
+__all__ = [
+    'panel_router', 'api_router', 'auth_router', 'image_router', 'page_router',
+]
