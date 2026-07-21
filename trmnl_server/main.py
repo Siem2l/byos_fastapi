@@ -25,10 +25,25 @@ from .routes import (
     page_router,
     panel_router,
 )
+from .routes.auth import require_ui_session
 from .routes.panel import configure
 from .screens import available
 
 logger = config.logger
+
+# The firmware's entire surface under /api/. The Pangolin edge bypasses SSO
+# for /api/* because an ESP32 cannot follow an SSO redirect, so anything
+# registered under this prefix is reachable from the open internet with
+# whatever credentials the route itself demands and nothing more. This list
+# is the allowlist enforced by `_assert_route_invariants()`; adding to it is
+# a deliberate act, not something a stray `APIRouter(prefix="/api")` can do
+# by accident.
+_DEVICE_API_PATHS = frozenset({
+    "/api/setup", "/api/setup/",
+    "/api/display", "/api/display/",
+    "/api/log", "/api/log/",
+    "/api/logs", "/api/logs/",
+})
 
 
 def _prepare_runtime(cfg: Config) -> None:
@@ -81,6 +96,47 @@ def _mount_static(app: FastAPI) -> None:
     # allowlist of the URLs the current rotation snapshot actually publishes,
     # served from the bytes already held in memory. Mounts cannot carry
     # Depends(), which is the other half of why this had to become a route.
+
+
+def _assert_route_invariants(app: FastAPI) -> None:
+    """Fail at startup rather than in production on an auth-shape regression.
+
+    Two invariants that were previously only comments:
+
+    1. Nothing but the firmware's fixed device surface may live under
+       `/api/`, because the edge bypasses SSO for that whole prefix. A
+       browser endpoint registered there would silently lose its Authentik
+       gate.
+    2. Every control-plane route must carry `require_ui_session`. The
+       dependency is attached to the router, so this holds by construction —
+       this asserts that it *stayed* attached.
+    """
+    for route in app.routes:
+        path = getattr(route, "path", "")
+        if path.startswith("/api/") and path not in _DEVICE_API_PATHS:
+            raise RuntimeError(
+                f"route {path!r} is registered under /api/, which the Pangolin "
+                "edge bypasses SSO for. Control-plane routes must live "
+                "outside /api/ (see routes/api.py). If this really is a "
+                "firmware endpoint, add it to _DEVICE_API_PATHS explicitly."
+            )
+
+    guarded = {
+        getattr(route, "path", "")
+        for route in api_router.routes
+    }
+    for route in app.routes:
+        path = getattr(route, "path", "")
+        if path not in guarded:
+            continue
+        calls = [
+            dep.call for dep in getattr(route, "dependant", None).dependencies
+        ] if getattr(route, "dependant", None) else []
+        if require_ui_session not in calls:
+            raise RuntimeError(
+                f"control-plane route {path!r} is not guarded by "
+                "require_ui_session — see routes/auth.py"
+            )
 
 
 def create_app(cfg: Config) -> FastAPI:
@@ -144,6 +200,8 @@ def create_app(cfg: Config) -> FastAPI:
             "(/rotation, /devices, /status, /server/*) will refuse every "
             "request with 503. Point it at a file holding the UI secret."
         )
+
+    _assert_route_invariants(app)
     return app
 
 
