@@ -453,6 +453,67 @@ def test_registering_a_control_plane_route_under_api_fails_the_build(client):
         _assert_route_invariants(client.app)
 
 
+# --- A: the device-log body cap must fit a real firmware batch -------------
+
+
+def _firmware_log_note(log_id: int, message: str) -> str:
+    """One entry of firmware 1.5.12's `logs_array`, envelope and all.
+
+    Shape taken from usetrmnl/trmnl-firmware v1.5.12 `submitLog()`: a
+    `device_status_stamp` block plus the note's own fields. The envelope is
+    ~325 B, which is what makes a 10-note batch of long messages ~13.8 KB.
+    """
+    return (
+        '{"creation_timestamp":1718000000,'
+        '"device_status_stamp":{"wifi_status":"connected",'
+        '"wakeup_reason":"timer","current_fw_version":"1.5.12",'
+        '"special_function":"sleep","refresh_rate":1800,'
+        '"time_since_last_sleep_start":1800,"battery_voltage":3.89,'
+        '"wifi_rssi_level":-62,"free_heap_size":123456,'
+        '"max_alloc_size":98304,"wakeup_reason_code":4,'
+        '"filesystem_ok":true,"battery_percent":74},'
+        f'"log_id":{log_id},"log_message":"{message}",'
+        '"log_codeline":1991,"log_sourcefile":"src/bl.cpp",'
+        '"log_retry":1,"additional_info":{"retry_attempt":1,'
+        '"filename_new":"","filename_current":""}}'
+    )
+
+
+def _firmware_log_batch(message_len: int, notes: int = 10) -> bytes:
+    """The single body `submitStoredLogs()` posts for a batch of `notes`."""
+    joined = ",".join(
+        _firmware_log_note(i, "E" * message_len) for i in range(notes)
+    )
+    return ('{"log":{"logs_array":[' + joined + "]}}").encode("utf-8")
+
+
+def test_log_endpoint_accepts_a_full_firmware_batch(client):
+    """10 notes x a full char[1024] message is real post-outage traffic.
+
+    LOG_MAX_NOTES_NUMBER is 10 and the NVS store is only cleared on a
+    successful submit, so a 413 here is permanent: the device re-posts the
+    same oversized batch forever.
+    """
+    from trmnl_server.routes import panel as panel_routes
+
+    panel_routes._log_buckets.clear()
+    body = _firmware_log_batch(1023)
+    assert 13000 <= len(body) <= panel_routes._LOG_MAX_BODY, len(body)
+    assert client.post("/api/log", content=body).status_code == 204
+
+
+def test_log_endpoint_still_rejects_an_absurd_body(client):
+    from trmnl_server.routes import panel as panel_routes
+
+    panel_routes._log_buckets.clear()
+    body = b"x" * (1024 * 1024)
+    assert client.post("/api/log", content=body).status_code == 413
+    # Chunked / lying Content-Length takes the streaming path, same answer.
+    assert client.post(
+        "/api/log", content=iter([b"x" * 8192] * 32)
+    ).status_code == 413
+
+
 # --- B: the refresh clamp holds on READ, not only on write ----------------
 
 

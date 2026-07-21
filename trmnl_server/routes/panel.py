@@ -84,7 +84,21 @@ _SEEN_DEVICES: set[str] = set()
 # It cannot be gated, so it is bounded instead. Every number below exists to
 # keep an anonymous caller from filling the filesystem that holds trmnl.db
 # and the rendered frames, or from evicting the enrolment audit trail.
-_LOG_MAX_BODY = 4096          # bytes accepted at all; larger -> 413
+#
+# Sized against the firmware, not against a guess. In usetrmnl/trmnl-firmware
+# v1.5.12 `submitStoredLogs()` comma-joins up to LOG_MAX_NOTES_NUMBER = 10
+# stored notes into ONE request body; each note carries ~325 B of JSON
+# envelope and its `message` is a char[1024]. A batch of 10 only ever forms
+# after an outage — which is precisely when the messages are long error
+# strings — and `bl.cpp` clears the NVS log store only on a successful
+# submit, so a single 413 makes the device re-post the same oversized batch
+# forever. Measured against real notes: a realistic 10-note batch is 3960 B
+# and a batch built from the longest real message is 4080 B, i.e. the old
+# 4096 B cap had 16 bytes of headroom and would have started rejecting real
+# traffic permanently. 16384 covers 10 x the worst-case note (~13.8 KB) with
+# room to spare. Nothing downstream grows: _LOG_MAX_STORED still bounds what
+# is persisted, so the extra bytes are read and discarded.
+_LOG_MAX_BODY = 16384         # bytes accepted at all; larger -> 413
 _LOG_MAX_STORED = 500         # characters actually persisted
 _LOG_RATE_WINDOW = 300.0      # seconds
 _LOG_RATE_LIMIT = 12          # accepted posts per window per source
