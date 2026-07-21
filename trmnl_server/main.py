@@ -29,9 +29,12 @@ def _prepare_runtime(cfg: Config) -> None:
     """Pin the paths the restored UI depends on before anything reads them."""
     config.set_panel_config(cfg)
     os.makedirs(cfg.state_dir, exist_ok=True)
-    # /generated is where the plugin scheduler writes rotation frames and
-    # where the UI's thumbnails point. It has to be writable, which under
-    # systemd means the StateDirectory and nothing else.
+    # Where the plugin scheduler writes rotation frames, and the root
+    # `utils.path_to_web_url()` maps to the `/generated/...` URLs the UI's
+    # thumbnails use. It has to be writable, which under systemd means the
+    # StateDirectory and nothing else. Nothing is served straight off this
+    # directory — `routes/images.py::serve_generated` serves an allowlist of
+    # current rotation members from memory instead.
     config.pin_generated_assets_dir(os.path.join(cfg.state_dir, "generated"))
     os.makedirs(config.WEB_GENERATED_DIR, exist_ok=True)
 
@@ -63,11 +66,15 @@ def _mount_static(app: FastAPI) -> None:
             "the package.",
             config.WEB_STATIC_DIR,
         )
-    app.mount(
-        "/generated",
-        StaticFiles(directory=config.WEB_GENERATED_DIR),
-        name="generated-static",
-    )
+    # There is deliberately no StaticFiles mount for /generated. A mount is a
+    # standing HTTP grant on a *directory*: it serves whatever happens to be
+    # in <state_dir>/generated now and forever, so a future plugin writing
+    # there publishes its output with no review step, and a render stays
+    # reachable at a stable, guessable path long after it has left the
+    # rotation. `routes/images.py::serve_generated` replaces it with an
+    # allowlist of the URLs the current rotation snapshot actually publishes,
+    # served from the bytes already held in memory. Mounts cannot carry
+    # Depends(), which is the other half of why this had to become a route.
 
 
 def create_app(cfg: Config) -> FastAPI:
@@ -114,6 +121,7 @@ def create_app(cfg: Config) -> FastAPI:
     app.include_router(image_router)
     app.include_router(page_router)
     _mount_static(app)
+
     return app
 
 

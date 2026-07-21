@@ -24,17 +24,20 @@ image handling exists to provide:
   have shadowed the gated route with an ungated one.
 
 The UI needs neither: its thumbnails read `state.current_preview_url`, which
-this fork points at the plugin-generated PNG under `/generated/...` (behind
-the same Authentik gate as the rest of the UI), and `entry.url_png` from the
-rotation snapshot, which resolves to the same place.
+this fork points at the plugin-generated PNG under `/generated/...`, and
+`entry.url_png` from the rotation snapshot, which resolves to the same place.
+Those URLs are served by `serve_generated` below — an allowlist of what the
+current rotation publishes, not a StaticFiles mount over the scheduler's
+output directory. See that function for why.
 
-What is left is `/images/current.png` — a convenience for looking at the
-frame the rotation currently holds, gated on the Access-Token like every
-other frame-bearing route this fork serves.
+What is left besides that is `/images/current.png` — a convenience for
+looking at the frame the rotation currently holds, gated on the Access-Token
+like every other frame-bearing route this fork serves.
 """
 
 from __future__ import annotations
 
+import re
 from io import BytesIO
 
 from fastapi import APIRouter, HTTPException, Request
@@ -46,6 +49,14 @@ from .panel import authorised
 
 router = APIRouter()
 logger = config.logger
+
+# Path shape `utils.path_to_web_url()` can produce: slash-separated segments
+# of conservative characters, ending in .png or .bmp. No segment may start
+# with a dot, so `..` never matches and traversal is rejected before the
+# allowlist lookup rather than relying on it.
+_GENERATED_RE = re.compile(
+    r'^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*\.(png|bmp)$'
+)
 
 
 def _binary_response(image_blob: BytesIO, media_type: str) -> Response:
@@ -60,6 +71,69 @@ def _binary_response(image_blob: BytesIO, media_type: str) -> Response:
         )
     headers = {'Content-Length': str(len(payload))}
     return Response(content=payload, media_type=media_type, headers=headers)
+
+
+def _not_found() -> JSONResponse:
+    return JSONResponse({'status': 404, 'error': 'not found'}, status_code=404)
+
+
+@router.get('/generated/{path:path}')
+def serve_generated(path: str) -> Response:
+    """Serve a plugin-generated frame, but only if the rotation publishes it.
+
+    This replaces `app.mount("/generated", StaticFiles(...))`. The mount was
+    not an internet-facing hole — `/generated/*` matches neither of the
+    edge's bypass rules (`/api/*`, `/image/*`), so it sits behind Authentik,
+    and it exposes neither the panel's nonce frames nor `trmnl.db`, both of
+    which live in `<state_dir>` itself rather than `<state_dir>/generated`.
+    What it *was* is a standing grant on a directory: whatever a future
+    plugin writes there becomes HTTP-reachable with no review step, at a
+    stable guessable path, for as long as the file exists — decoupled from
+    whether the rotation still contains it.
+
+    So: the app decides what is servable rather than delegating that to the
+    filesystem. The URL string is byte-identical to what
+    `utils.path_to_web_url()` produced before, which matters more than it
+    looks — `state._rotation_entry_id()` embeds these URLs in the entry IDs
+    persisted in `rotation_playlists`, and `build_rotation_snapshot()` prunes
+    and re-persists any saved playlist whose IDs it cannot resolve. Changing
+    the URL scheme would silently wipe the user's playlists.
+
+    The bytes come from memory: `append_rotation_assets` /
+    `set_primary_rotation_assets` read each file once at publish time into
+    `master['bmp_entries']` / `['png_entries']`, and every other read path in
+    this fork already serves from there. The files on disk stay — the
+    scheduler's `_assets_exist()` staleness check needs them.
+
+    Deliberately a plain `Response` and not `_binary_response()`: that helper
+    runs `ensure_png_payload_under_budget(levels=4)`, which would re-quantise
+    an oversized payload to four dithered grey levels. These are mode-"1"
+    renders and must stay that way.
+    """
+    if not _GENERATED_RE.match(path):
+        return _not_found()
+    url = f'/generated/{path}'
+    with state.STATE_LOCK:
+        meta = list(state.rotation_master().get('meta') or [])
+    for idx, entry in enumerate(meta):
+        if entry.get('url_png') == url:
+            getter, media = state.get_rotation_png_bytes, 'image/png'
+        elif entry.get('url_bmp') == url:
+            getter, media = state.get_rotation_bmp_bytes, 'image/bmp'
+        else:
+            continue
+        try:
+            payload = getter(idx)
+        except state.RotationUnavailableError:
+            # meta and the byte lists are appended under the same lock, so
+            # this means the rotation was rebuilt between the two reads.
+            return _not_found()
+        return Response(
+            content=payload,
+            media_type=media,
+            headers={'Cache-Control': 'no-store'},
+        )
+    return _not_found()
 
 
 @router.get('/images/current.png')

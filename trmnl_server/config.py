@@ -76,9 +76,15 @@ CONFIG_DIR = getcwd()
 # directory. Under the NixOS unit there is no WorkingDirectory and
 # DynamicUser starts in `/`, so `web` and `var/generated` would resolve to
 # `/web` and `/var/generated` — neither of which exists, and both of which
-# `ProtectSystem = "strict"` makes unwritable. StaticFiles() raises at
-# construction when its directory is missing, so that would take the whole
-# unit down at startup rather than merely breaking the UI.
+# `ProtectSystem = "strict"` makes unwritable. For the static root that is
+# fatal: StaticFiles() raises at construction when its directory is
+# missing, taking the whole unit down at startup rather than merely
+# breaking the UI. The generated root is no longer served by StaticFiles
+# (routes/images.py serves an allowlist from memory instead), but it is
+# still the plugin scheduler's write target and the base that
+# `utils.path_to_web_url()` maps to `/generated/...`, so it must stay
+# pinned to a writable location with a stable path — the persisted
+# playlist IDs embed those URLs.
 #
 # Both roots are therefore pinned to locations that are correct by
 # construction: the static assets to the copy installed inside the package,
