@@ -47,7 +47,14 @@ from fastapi.responses import JSONResponse, Response
 
 from .. import models
 from ..credentials import secret_equal
-from ..config import Config, TokenUnavailable, normalise_mac, panel_config
+from ..config import (
+    MAX_REFRESH_INTERVAL,
+    MIN_REFRESH_INTERVAL,
+    Config,
+    TokenUnavailable,
+    normalise_mac,
+    panel_config,
+)
 from ..plugins.garmin import SLUG_BY_PLUGIN
 from ..render import render_notice, render_screen
 from ..screens import available as available_screens
@@ -410,6 +417,38 @@ def api_setup(request: Request) -> JSONResponse:
     })
 
 
+def _clamped_refresh(seconds: int, device_id: str) -> int:
+    """Bound the number handed to the panel's deep-sleep timer.
+
+    This is the LAST thing between `device_profiles.refresh_interval` and the
+    hardware, and it is deliberately not the only clamp: `PATCH /devices/{id}`
+    refuses an out-of-range write. But that check only ever sees values that
+    arrive through it. The row is what the panel actually reads, it outlives
+    the code that wrote it, and it is reachable by anything holding the
+    SQLite file — a build whose PATCH was unauthenticated, a restored
+    backup, `sqlite3 trmnl.db "update device_profiles set ..."`. A `1` in
+    that column is a flat battery in hours, so the value is clamped where it
+    is consumed rather than trusted because of where it was supposed to have
+    come from.
+    """
+    try:
+        value = int(seconds)
+    except (TypeError, ValueError):
+        value = MIN_REFRESH_INTERVAL
+    clamped = max(MIN_REFRESH_INTERVAL, min(MAX_REFRESH_INTERVAL, value))
+    if clamped != value:
+        # The journal already carries the full MAC (see `_note_device`), so
+        # naming the device here leaks nothing that is not already there.
+        # This never reaches the `logs` table.
+        logger.warning(
+            "refresh interval %rs for device %s is outside [%s, %s]; "
+            "serving %ss instead",
+            seconds, device_id,
+            MIN_REFRESH_INTERVAL, MAX_REFRESH_INTERVAL, clamped,
+        )
+    return clamped
+
+
 @router.get("/api/display")
 @router.get("/api/display/")
 def api_display(request: Request) -> JSONResponse:
@@ -437,8 +476,10 @@ def api_display(request: Request) -> JSONResponse:
     # freshness against battery, and it is what upstream's Devices tab
     # writes. The screen's declared interval remains the default.
     override = state.ensure_device_profile(device_id).get("refresh_interval")
-    if isinstance(override, int) and override > 0:
+    # bool is an int subclass; `True` must not become a 1-second poll.
+    if isinstance(override, int) and not isinstance(override, bool) and override > 0:
         refresh = override
+    refresh = _clamped_refresh(refresh, device_id)
 
     # NEVER put `name` in here. It is the live frame nonce, and that nonce is
     # the *only* thing protecting `/image/<name>` — the firmware fetches the

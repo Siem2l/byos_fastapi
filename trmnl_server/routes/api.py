@@ -54,13 +54,13 @@ except ImportError:  # pragma: no cover
 router = APIRouter(dependencies=[Depends(require_ui_session)])
 logger = config.logger
 
-# What a device's refresh interval may be set to, in seconds. `/api/display`
-# applies this value verbatim, so it is a write into physical hardware
-# behaviour: 1 s would flatten the battery in hours, 86400 s would freeze the
-# display for a day. Auth is the gate; this clamp is the blast radius, and it
-# holds even for a caller holding a valid session.
-MIN_REFRESH_INTERVAL = 60
-MAX_REFRESH_INTERVAL = 21600
+# What a device's refresh interval may be set to, in seconds. Auth is the
+# gate; this rejection is the blast radius, and it holds even for a caller
+# holding a valid session. The bounds live in `config` because
+# `routes/panel.py::api_display` enforces the same pair on the way *out* —
+# see the comment there for why a write-side check on its own is worthless.
+MIN_REFRESH_INTERVAL = config.MIN_REFRESH_INTERVAL
+MAX_REFRESH_INTERVAL = config.MAX_REFRESH_INTERVAL
 
 
 def _cpu_load_percent() -> float:

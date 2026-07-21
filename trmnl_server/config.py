@@ -353,6 +353,24 @@ def normalise_mac(value: str) -> str:
     return ''.join(c for c in value.lower() if c.isalnum())
 
 
+# What a device's poll interval may be, in seconds. `/api/display` hands this
+# number straight to the ESP32's deep-sleep timer, so it is a write into
+# physical hardware behaviour: 1 s flattens the battery in hours, 86400 s
+# freezes the glass for a day.
+#
+# Enforced in TWO places, and both are load-bearing. `PATCH /devices/{id}`
+# rejects an out-of-range value (routes/api.py) so the UI cannot store one;
+# `api_display()` clamps whatever it reads back (routes/panel.py) so a row
+# that got into `device_profiles` some other way cannot reach the panel. A
+# write-side check alone is worth nothing here — the row outlives the code
+# that wrote it, and anything with the SQLite file (an older build whose
+# PATCH was unauthenticated, a restore from backup, a future bug, an
+# operator with sqlite3) can put a 1 in that column. Read-side clamping is
+# what actually protects the hardware.
+MIN_REFRESH_INTERVAL = 60
+MAX_REFRESH_INTERVAL = 21600
+
+
 class TokenUnavailable(RuntimeError):
     """A secret file is configured but its contents could not be read.
 
