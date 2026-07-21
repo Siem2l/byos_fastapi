@@ -447,3 +447,76 @@ def test_registering_a_control_plane_route_under_api_fails_the_build(client):
     client.app.include_router(stray)
     with pytest.raises(RuntimeError, match="registered under /api/"):
         _assert_route_invariants(client.app)
+
+
+# --- C: a non-ASCII credential is a 401, never a 500 ----------------------
+
+
+NON_ASCII = "café-ÿ-中文"
+# Header values have to go on the wire as raw bytes: httpx refuses to encode
+# a non-ASCII `str` into a header, while a real client just sends the bytes
+# and Starlette decodes them latin-1 into exactly the non-ASCII `str` that
+# `hmac.compare_digest` refuses to compare.
+NON_ASCII_HEADER = NON_ASCII.encode("utf-8")
+
+
+def test_non_ascii_access_token_is_rejected_not_a_500(client):
+    """`hmac.compare_digest` raises TypeError on non-ASCII str.
+
+    /api/* bypasses the edge's SSO, so this is reachable from the open
+    internet: it must be a 401, not an unhandled exception.
+    """
+    resp = client.get(
+        "/api/display", headers={"ID": MAC, "Access-Token": NON_ASCII_HEADER}
+    )
+    assert resp.status_code == 401
+
+
+def test_non_ascii_access_token_on_preview_is_rejected(client):
+    resp = client.get(
+        "/preview/readiness.png", headers={"Access-Token": NON_ASCII_HEADER}
+    )
+    assert resp.status_code == 401
+
+
+def test_non_ascii_ui_token_is_rejected_not_a_500(client):
+    assert client.post(
+        "/auth/session", json={"token": NON_ASCII}
+    ).status_code == 401
+    assert client.post(
+        "/auth/session", headers={"X-TRMNL-UI-Token": NON_ASCII_HEADER}
+    ).status_code == 401
+
+
+def test_lone_surrogate_ui_token_is_rejected_not_a_500(client):
+    """What a JSON body can decode to, and what utf-8 refuses to encode."""
+    resp = client.post(
+        "/auth/session",
+        content=b'{"token": "\\ud800"}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 401
+
+
+def test_non_ascii_session_cookie_is_rejected_not_a_500(client):
+    resp = client.get(
+        "/rotation",
+        headers={"Cookie": "trmnl_ui=v1.9999999999.aabbccdd.caf\xc3\xa9".encode("latin-1")},
+    )
+    assert resp.status_code == 401
+
+
+def test_secret_equal_never_raises():
+    from trmnl_server.credentials import secret_equal
+
+    assert secret_equal("a", "a") is True
+    assert secret_equal("café", "café") is True
+    assert secret_equal("café", "a") is False
+    assert secret_equal(None, "a") is False
+    assert secret_equal("a", None) is False
+    assert secret_equal("a", "") is False
+    assert secret_equal(b"a", "a") is True
+    assert secret_equal(42, "a") is False
+    # A lone surrogate: what a JSON body can decode to, and what plain
+    # utf-8 encoding refuses.
+    assert secret_equal("\ud800", "a") is False

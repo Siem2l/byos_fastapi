@@ -50,6 +50,7 @@ from fastapi import APIRouter, Body, HTTPException, Request, Response
 
 from .. import config as config_module
 from ..config import panel_config
+from ..credentials import secret_equal
 
 logger = config_module.logger
 
@@ -100,9 +101,12 @@ def _valid_session_value(secret: str, value: str) -> bool:
         return False
     payload = ".".join(parts[:3])
     expected = _sign(_session_key(secret), payload)
-    # compare_digest before the (cheap) expiry check so a forged signature
-    # and an expired-but-valid one cost the same.
-    if not hmac.compare_digest(signature, expected):
+    # Constant-time compare before the (cheap) expiry check so a forged
+    # signature and an expired-but-valid one cost the same. `secret_equal`
+    # rather than `hmac.compare_digest` because the cookie is attacker-
+    # supplied and header values decode as latin-1, so a non-ASCII cookie
+    # would otherwise raise TypeError and 500 — see credentials.py.
+    if not secret_equal(signature, expected):
         return False
     try:
         exp = int(exp_raw)
@@ -202,9 +206,10 @@ def create_session(
         candidate = data.get("token")
         if isinstance(candidate, str):
             supplied = candidate
-    # compare_digest on both branches, so a missing token and a wrong one
-    # take the same path.
-    if not hmac.compare_digest(supplied.strip(), secret):
+    # One constant-time comparison on both branches, so a missing token and a
+    # wrong one take the same path — and a non-ASCII one is a 401, not the
+    # 500 `hmac.compare_digest` would raise on it.
+    if not secret_equal(supplied.strip(), secret):
         return Response(status_code=401)
     response = Response(status_code=204)
     _set_cookie(response, mint_session(secret))

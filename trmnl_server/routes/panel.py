@@ -35,7 +35,6 @@ been opened.
 
 from __future__ import annotations
 
-import hmac
 import re
 import secrets
 import threading
@@ -47,6 +46,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
 from .. import models
+from ..credentials import secret_equal
 from ..config import Config, normalise_mac, panel_config
 from ..plugins.garmin import SLUG_BY_PLUGIN
 from ..render import render_notice, render_screen
@@ -236,9 +236,12 @@ def authorised(request: Request) -> bool:
     if not expected:
         return True
     supplied = request.headers.get("Access-Token") or ""
-    # compare_digest, not ==, so a wrong token cannot be recovered a byte
-    # at a time from response timing.
-    return hmac.compare_digest(supplied.strip(), expected)
+    # secret_equal, not == and not bare compare_digest: constant time so a
+    # wrong token cannot be recovered a byte at a time from response timing,
+    # and byte-based so a non-ASCII header value is a 401 rather than the
+    # TypeError compare_digest raises on non-ASCII `str` (see credentials.py
+    # — this route is reachable from the open internet).
+    return secret_equal(supplied.strip(), expected)
 
 
 def _device_label(device: str | None) -> str:
