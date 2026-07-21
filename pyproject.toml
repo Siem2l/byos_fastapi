@@ -22,3 +22,13 @@ trmnl-server = "trmnl_server.main:run"
 
 [tool.setuptools.packages.find]
 include = ["trmnl_server*"]
+
+# The web UI lives inside the package (rather than at the repo root, where
+# upstream keeps it) purely so it survives installation: a wheel can only
+# carry data files that sit under a package directory. `pages.py` and the
+# `/web` StaticFiles mount both resolve it via `config.WEB_STATIC_DIR`,
+# which is pinned to this directory at import time — so the UI works
+# identically from a source checkout and from the Nix store, with no
+# `postInstall` copy and no extra environment variable.
+[tool.setuptools.package-data]
+trmnl_server = ["web/**/*"]

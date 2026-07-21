@@ -215,13 +215,17 @@ def get_logs(limit: int = 20) -> List[LogEntry]:
 def get_logs_after(last_id: int, limit: int = 50) -> List[LogEntry]:
     """Get log entries with an ID greater than the provided cursor."""
     with SessionLocal() as db:
+        # Upstream ignores `limit` here, so the first poll after a long idle
+        # returns the entire table in one response. The UI keeps a 200-entry
+        # ring buffer anyway, so honour the cap and take the newest rows.
         query = (
             select(LogEntry)
             .where(LogEntry.id > last_id)
-            .order_by(LogEntry.timestamp.asc())
+            .order_by(LogEntry.id.desc())
+            .limit(limit)
         )
         result = db.execute(query)
-        return list(result.scalars().all())
+        return list(reversed(result.scalars().all()))
 
 
 def _serialize_list(values: Optional[List[str]]) -> str:
