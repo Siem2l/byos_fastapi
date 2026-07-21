@@ -797,3 +797,92 @@ def test_generated_does_not_leak_existence_to_anonymous_callers(client):
     """401 before the path check, so 404-vs-401 is not an enumeration oracle."""
     assert client.get("/generated/garmin/nothing.png").status_code == 401
     assert client.get("/generated/trmnl.db").status_code == 401
+
+
+# --- H/I/J: the session endpoint's own edges ------------------------------
+
+
+def test_logout_is_origin_pinned(ui_client):
+    resp = ui_client.delete(
+        "/auth/session",
+        headers={"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site"},
+    )
+    assert resp.status_code == 403
+    # ...and the session is untouched.
+    assert ui_client.get("/rotation").status_code == 200
+    assert ui_client.delete("/auth/session").status_code == 204
+    assert ui_client.get("/rotation").status_code == 401
+
+
+def test_session_mint_is_throttled_after_repeated_failures(client):
+    from trmnl_server.routes import auth as auth_module
+
+    auth_module._mint_failures.clear()
+    auth_module._mint_global_failures.clear()
+    codes = [
+        client.post("/auth/session", json={"token": f"guess-{i}"}).status_code
+        for i in range(auth_module._MINT_FAIL_LIMIT + 5)
+    ]
+    assert codes[: auth_module._MINT_FAIL_LIMIT] == [401] * auth_module._MINT_FAIL_LIMIT
+    assert set(codes[auth_module._MINT_FAIL_LIMIT :]) == {429}
+    # Throttled means throttled: the right secret does not get through either.
+    assert client.post("/auth/session", json={"token": UI_TOKEN}).status_code == 429
+    auth_module._mint_failures.clear()
+    auth_module._mint_global_failures.clear()
+
+
+def test_a_successful_login_clears_the_failure_counter(client):
+    """One fat-fingered secret must not lock the operator out later."""
+    from trmnl_server.routes import auth as auth_module
+
+    auth_module._mint_failures.clear()
+    auth_module._mint_global_failures.clear()
+    for _ in range(auth_module._MINT_FAIL_LIMIT - 1):
+        assert client.post("/auth/session", json={"token": "nope"}).status_code == 401
+    assert client.post("/auth/session", json={"token": UI_TOKEN}).status_code == 204
+    for _ in range(auth_module._MINT_FAIL_LIMIT - 1):
+        assert client.post("/auth/session", json={"token": "nope"}).status_code == 401
+    assert client.post("/auth/session", json={"token": UI_TOKEN}).status_code == 204
+    auth_module._mint_failures.clear()
+    auth_module._mint_global_failures.clear()
+
+
+def test_origin_pin_ignores_a_client_supplied_host(ui_client):
+    """The pin is TRMNL_BASE_URL, not "whatever Host the caller sent".
+
+    `request.base_url` is built from the Host header, so accepting it made
+    the rule "Origin must match a value the caller also controls".
+    """
+    resp = ui_client.post(
+        "/rotation",
+        json={"playlist": []},
+        headers={
+            "Host": "evil.example",
+            "Origin": "https://evil.example",
+        },
+    )
+    assert resp.status_code == 403
+
+
+def test_origin_pin_falls_back_to_the_request_url_without_a_base_url(ui_client):
+    """A source checkout with no TRMNL_BASE_URL is still usable from itself."""
+    from trmnl_server.config import panel_config
+
+    cfg = panel_config()
+    original = cfg.base_url
+    cfg.base_url = ""
+    try:
+        ok = ui_client.post(
+            "/rotation",
+            json={"playlist": []},
+            headers={"Origin": "https://trmnl.example"},
+        )
+        assert ok.status_code == 200
+        bad = ui_client.post(
+            "/rotation",
+            json={"playlist": []},
+            headers={"Origin": "https://evil.example"},
+        )
+        assert bad.status_code == 403
+    finally:
+        cfg.base_url = original
