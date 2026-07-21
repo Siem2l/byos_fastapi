@@ -2,7 +2,20 @@ import datetime
 import json
 from typing import Dict, List, Optional, Tuple
 
-from sqlalchemy import DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine, inspect, select, text
+from sqlalchemy import (
+    DateTime,
+    Float,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    delete,
+    func,
+    inspect,
+    select,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from . import config
@@ -137,6 +150,10 @@ def init_db() -> None:
     reconfigure_engine()
     Base.metadata.create_all(bind=engine)
     _ensure_device_state_schema()
+    # A table that grew past the cap under an older build (or before this
+    # process's counter existed) is cut back here rather than after another
+    # _LOG_TRIM_SLACK inserts.
+    trim_logs()
 
 
 def _ensure_device_state_schema() -> None:
@@ -193,14 +210,72 @@ def get_battery_history(
         return list(result.scalars().all())
 
 
+# Hard ceiling on the `logs` table, enforced on write with oldest-first
+# eviction. `POST /api/log` is unauthenticated by necessity (the firmware
+# posts with no credential, and /api/* is bypassed at the edge), so without a
+# cap an anonymous caller can grow this table until the filesystem holding
+# trmnl.db *and the rendered frames* is full — which takes the panel down,
+# not just the log view. The UI keeps a 200-entry ring buffer and
+# `get_logs()` caps at 200 rows, so nothing reads more than a fraction of
+# this; the headroom is for the enrolment audit trail, which must not be
+# evicted by a burst of device chatter within any realistic window.
+LOG_ROW_CAP = 5000
+# Deleting one row per insert once at the cap would mean a DELETE on every
+# single request. Instead let the table overshoot by this much and then trim
+# back to the cap in one statement.
+_LOG_TRIM_SLACK = 500
+
+_log_rows_since_trim = 0
+
+
+def _trim_logs(db: Session) -> None:
+    """Evict oldest-first so the table cannot exceed LOG_ROW_CAP + slack."""
+    total = db.execute(select(func.count()).select_from(LogEntry)).scalar_one()
+    if total <= LOG_ROW_CAP + _LOG_TRIM_SLACK:
+        return
+    # id is the monotonic insertion order; timestamp is not unique enough to
+    # order by on its own under a burst.
+    cutoff = db.execute(
+        select(LogEntry.id)
+        .order_by(LogEntry.id.desc())
+        .offset(LOG_ROW_CAP - 1)
+        .limit(1)
+    ).scalar_one_or_none()
+    if cutoff is None:
+        return
+    db.execute(delete(LogEntry).where(LogEntry.id < cutoff))
+    logger.info("trimmed logs table to %s rows", LOG_ROW_CAP)
+
+
+def trim_logs() -> None:
+    """Enforce LOG_ROW_CAP now. Called on write and once at startup."""
+    global _log_rows_since_trim
+    _log_rows_since_trim = 0
+    try:
+        with SessionLocal() as db:
+            _trim_logs(db)
+            db.commit()
+    except Exception as exc:  # noqa: BLE001 - logging must never 500 a poll
+        logger.warning("Failed to trim logs table: %s", exc)
+
+
 def add_log_entry(context: str, info: str) -> LogEntry:
-    """Add a new log entry."""
+    """Add a new log entry, evicting the oldest rows past LOG_ROW_CAP."""
+    global _log_rows_since_trim
     with SessionLocal() as db:
         log = LogEntry(context=context, info=info)
         db.add(log)
         db.commit()
         db.refresh(log)
-        return log
+    _log_rows_since_trim += 1
+    # Counting rows on every insert would be a table scan per request. The
+    # counter is a process-local hint; a restart just means the startup trim
+    # in init_db() does the work instead, and _trim_logs() re-checks the real
+    # count before deleting anything. The trim runs in its own session so a
+    # second commit cannot expire the row this returns.
+    if _log_rows_since_trim >= _LOG_TRIM_SLACK:
+        trim_logs()
+    return log
 
 
 def get_logs(limit: int = 20) -> List[LogEntry]:

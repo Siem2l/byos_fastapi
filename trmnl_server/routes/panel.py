@@ -69,6 +69,22 @@ _ERROR_RETRY = 300
 # rather than one per poll.
 _SEEN_DEVICES: set[str] = set()
 
+# --- POST /api/log limits -------------------------------------------------
+#
+# This endpoint is unauthenticated by necessity: the firmware posts device
+# errors here with no credential of any kind, and it sits inside the edge's
+# /api/* SSO bypass, so it is reachable from the open internet by anyone.
+# It cannot be gated, so it is bounded instead. Every number below exists to
+# keep an anonymous caller from filling the filesystem that holds trmnl.db
+# and the rendered frames, or from evicting the enrolment audit trail.
+_LOG_MAX_BODY = 4096          # bytes accepted at all; larger -> 413
+_LOG_MAX_STORED = 500         # characters actually persisted
+_LOG_RATE_WINDOW = 300.0      # seconds
+_LOG_RATE_LIMIT = 12          # accepted posts per window per source
+_LOG_RATE_MAX_SOURCES = 512   # distinct sources tracked, to bound the bucket
+_log_buckets: dict[str, list[float]] = {}
+_log_bucket_lock = threading.Lock()
+
 router = APIRouter()
 
 
@@ -417,14 +433,78 @@ def api_display(request: Request) -> JSONResponse:
     })
 
 
+def _log_rate_ok(source: str) -> bool:
+    """Sliding-window limiter, keyed on the device ID the poster claims.
+
+    The key is self-asserted, so this is not an authorisation control — it
+    bounds a cooperative firmware's chatter and forces a determined abuser to
+    rotate the ID header, which then hits `_LOG_RATE_MAX_SOURCES`. Combined
+    with the row cap in `models.add_log_entry()`, the worst case is bounded
+    write pressure on a table that can no longer grow.
+    """
+    now = time.monotonic()
+    cutoff = now - _LOG_RATE_WINDOW
+    with _log_bucket_lock:
+        if len(_log_buckets) > _LOG_RATE_MAX_SOURCES:
+            # Drop sources with nothing left in the window, then, if that was
+            # not enough, drop the lot rather than grow without bound.
+            for key in [k for k, v in _log_buckets.items() if not v or v[-1] < cutoff]:
+                del _log_buckets[key]
+            if len(_log_buckets) > _LOG_RATE_MAX_SOURCES:
+                _log_buckets.clear()
+        hits = [t for t in _log_buckets.get(source, []) if t >= cutoff]
+        if len(hits) >= _LOG_RATE_LIMIT:
+            _log_buckets[source] = hits
+            return False
+        hits.append(now)
+        _log_buckets[source] = hits
+        return True
+
+
 @router.post("/api/log")
 @router.post("/api/log/")
 @router.post("/api/logs")
 @router.post("/api/logs/")
 async def api_log(request: Request) -> Response:
-    body = await request.body()
-    text = body.decode("utf-8", "replace")[:2000]
-    logger.warning("device log: %s", text)
+    """Device-side error reports. Unauthenticated, and necessarily so.
+
+    The firmware posts here with no credential, and `/api/*` is bypassed at
+    the edge, so this is an open write endpoint on the public internet. It
+    persists to the same SQLite file that sits beside the rendered frames, so
+    an unbounded version of this route is a filesystem-exhaustion primitive
+    that also evicts the enrolment audit trail. Three bounds, none of which
+    change the firmware's happy path: a body cap, a stored-text cap, and a
+    per-source rate limit. The table itself is capped in `models`.
+    """
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            if int(declared) > _LOG_MAX_BODY:
+                return Response(status_code=413)
+        except ValueError:
+            return Response(status_code=400)
+
+    # Content-Length is a claim, not a fact (and chunked requests omit it),
+    # so read incrementally and abandon the moment the cap is passed rather
+    # than buffering whatever the peer decides to send.
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > _LOG_MAX_BODY:
+            return Response(status_code=413)
+        chunks.append(chunk)
+
+    source = _device_label(request.headers.get("ID"))
+    if not _log_rate_ok(source):
+        logger.warning("device log rate limit hit for %s", source)
+        return Response(status_code=429)
+
+    text = b"".join(chunks).decode("utf-8", "replace")
+    # Collapse newlines: the UI's log view is one row per entry, and a body
+    # full of them would otherwise stretch one report across the whole pane.
+    text = " ".join(text.split())[:_LOG_MAX_STORED]
+    logger.warning("device log from %s: %s", source, text)
     # Also to SQLite, which is what the UI's Server Logs tab reads.
     models.add_log_entry("device log", text or "<empty>")
     return Response(status_code=204)
