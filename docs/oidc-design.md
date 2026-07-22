@@ -28,14 +28,25 @@ mint rate-limiting, and the property that rotating the signing secret
 invalidates every session.
 
 **OIDC does not replace any of that.** It adds one more path that ends in
-`mint_session(...)`. Everything downstream is unchanged, which is what keeps
+`issue_session(...)`. Everything downstream is unchanged, which is what keeps
 this small and reviewable.
 
 ```
 shared-secret login ─┐
-                     ├─→ mint_session() → trmnl_ui cookie → require_ui_session()
+                     ├─→ issue_session() → trmnl_ui cookie → require_ui_session()
 OIDC code flow ──────┘
 ```
+
+> **Implementation note.** "Everything downstream is unchanged" holds for the
+> gate, the format and the signing key, but *not* for the TTL, and treating
+> that as one more thing to share was wrong. A shared-secret session has no
+> external authority to diverge from — possession of the file is the
+> authorization, and rotating it revokes everything. An OIDC session is a
+> cached claim about an authorization the IdP can withdraw silently, so at 30
+> days a de-grouped operator kept their dashboard for a month. OIDC sessions
+> therefore get `TRMNL_OIDC_SESSION_TTL` (default 8 hours), and
+> `issue_session()` exists so the signed expiry and the cookie's `max-age` are
+> one number rather than two constants that happen to agree.
 
 Both paths stay available. An operator with no IdP keeps the overlay; an
 operator with Authentik/Keycloak/Authelia/Pocket ID gets real SSO. Neither is

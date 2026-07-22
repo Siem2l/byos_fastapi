@@ -96,6 +96,10 @@ OIDC code flow ──────┘
 
 Both are optional and independently usable. **With neither configured the
 control plane answers 503 to everything** — it fails closed rather than open.
+The one thing the two do not share is how long the cookie lives: 30 days from
+the shared secret, 8 hours from OIDC, because only the latter has a provider
+behind it that can revoke access without telling this server. See
+`TRMNL_OIDC_SESSION_TTL` below.
 
 **The device surface is never touched by either.** `/api/setup`,
 `/api/display`, `/api/log`, `/api/logs` and `/image/*` take a MAC allowlist
@@ -132,6 +136,7 @@ Setting `TRMNL_OIDC_ISSUER` enables the feature.
 | `TRMNL_OIDC_GROUPS_CLAIM` | Default `groups`. A dotted value such as `resource_access.trmnl.roles` is tried as a flat key first and only then traversed as a path. |
 | `TRMNL_OIDC_REDIRECT_URL` | Defaults to `<TRMNL_BASE_URL>/auth/oidc/callback`. Must be under `TRMNL_BASE_URL`. |
 | `TRMNL_OIDC_PROVIDER_NAME` | Display name on the "Sign in with ..." button. Defaults to the issuer's hostname. |
+| `TRMNL_OIDC_SESSION_TTL` | Seconds an OIDC session lasts. Default `28800` (8 hours). See below. |
 
 `TRMNL_BASE_URL` is **required** for OIDC: with no fixed public origin there
 is nothing to derive the redirect URI from and nothing to allowlist it
@@ -164,6 +169,19 @@ call in its own right and whose `sub` must match the ID token's exactly
 **signed** userinfo response (`Content-Type: application/jwt`) is *refused*
 rather than consumed unverified — leave your provider's userinfo signing
 algorithm at `none`.
+
+**An OIDC session lasts 8 hours, not the 30 days a shared-secret session
+gets** (`TRMNL_OIDC_SESSION_TTL`, in seconds). The difference is deliberate.
+A shared-secret session has no external authority to fall out of step with:
+holding `TRMNL_UI_TOKEN_FILE` *is* the authorization, and rotating that file
+revokes every session on the next request. An OIDC session is a cached claim
+about an authorization your provider granted and can withdraw at any time —
+remove someone from the group in `TRMNL_OIDC_ALLOWED_GROUPS`, disable their
+account, offboard them — and this server is never told. Whatever you set here
+is the window in which a revoked operator still has a dashboard. The renewal
+costs nothing visible: the provider's own session is normally still valid, so
+it is a redirect that answers without prompting. Raise it if you want; it is
+your revocation lag.
 
 Both `/auth/oidc/login` and `/auth/oidc/callback` are rate limited, on
 counters separate from `POST /auth/session`'s, so traffic against one login

@@ -370,6 +370,11 @@ def normalise_mac(value: str) -> str:
 MIN_REFRESH_INTERVAL = 60
 MAX_REFRESH_INTERVAL = 21600
 
+# Default lifetime of an OIDC-minted control-plane session, in seconds. One
+# working day. See `Config.oidc_session_ttl` for why it is not the thirty days
+# a shared-secret session gets.
+_OIDC_SESSION_TTL_DEFAULT = 8 * 3600
+
 
 class TokenUnavailable(RuntimeError):
     """A secret file is configured but its contents could not be read.
@@ -473,6 +478,25 @@ class Config:
     # issuer's hostname, which is right often enough to be a sane default.
     oidc_provider_name: str = field(default_factory=lambda: environ.get(
         'TRMNL_OIDC_PROVIDER_NAME', '').strip())
+    # Lifetime of a session cookie minted by the OIDC path, in seconds.
+    # Deliberately far shorter than the shared secret's thirty days, and the
+    # reason is what the two credentials mean. The shared secret has no
+    # external authority to diverge from: possession *is* the authorization,
+    # and a long session says nothing the secret did not already say. An OIDC
+    # session is a cached claim about an authorization somebody else granted
+    # and can withdraw — remove an operator from `TRMNL_OIDC_ALLOWED_GROUPS`'
+    # matching group, disable their account, offboard them entirely — and this
+    # server never hears about it. Whatever this number is, it is the window in
+    # which a revoked operator still has a dashboard.
+    #
+    # Eight hours is a working day: one login in the morning, and the renewal
+    # is a redirect the IdP usually answers without prompting at all, because
+    # the *IdP's* session is the thing still alive. That is the trade this
+    # value makes — a re-check against the authority, at a cost of roughly one
+    # invisible redirect a day.
+    oidc_session_ttl: int = field(default_factory=lambda: _env_int(
+        'TRMNL_OIDC_SESSION_TTL', _OIDC_SESSION_TTL_DEFAULT,
+        'oidc_session_ttl'))
 
     # Serve fabricated data instead of reading GarminDB. Lets the unit be
     # smoke-tested on a host where the import has not run yet.
@@ -584,6 +608,27 @@ class Config:
         if self.oidc_redirect_url:
             return self.oidc_redirect_url
         return f"{self.base_url.rstrip('/')}/auth/oidc/callback"
+
+    def oidc_session_lifetime(self) -> int:
+        """Seconds an OIDC-minted session cookie is good for.
+
+        A method rather than the raw field so the value is validated wherever
+        it came from — the environment, or a test (or a future settings
+        endpoint) assigning the field directly. Zero or negative would mint a
+        cookie that is already expired, i.e. an OIDC login that silently never
+        logs anyone in, so it is refused in favour of the default and said out
+        loud. There is no upper clamp: an operator who wants thirty days can
+        have them, and `SESSION_TTL` is what they get by asking for it.
+        """
+        ttl = self.oidc_session_ttl
+        if not isinstance(ttl, int) or isinstance(ttl, bool) or ttl <= 0:
+            logger.error(
+                'TRMNL_OIDC_SESSION_TTL is %r, which is not a positive number '
+                'of seconds — falling back to %d',
+                ttl, _OIDC_SESSION_TTL_DEFAULT,
+            )
+            return _OIDC_SESSION_TTL_DEFAULT
+        return ttl
 
     def session_secret(self) -> str | None:
         """Key material for the `trmnl_ui` cookie, from either login path.
