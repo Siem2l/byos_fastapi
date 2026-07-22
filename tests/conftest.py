@@ -101,7 +101,9 @@ def _reset_process_state() -> None:
     from trmnl_server.routes import oidc as oidc_routes
 
     oidc_module.reset_caches()
-    oidc_routes.reset_state_store()
+    # A *fresh ledger object*, not a flush of the live one: production has no
+    # way to empty the single-use state store, on purpose. See routes/oidc.py.
+    oidc_routes._state_ledger = oidc_routes._StateLedger()
     oidc_routes.CALLBACK_BUDGET.reset()
     oidc_routes.LOGIN_BUDGET.reset()
 

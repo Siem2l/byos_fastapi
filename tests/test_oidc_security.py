@@ -634,3 +634,54 @@ def test_s256_is_selected_even_when_plain_is_also_offered(client, tmp_path):
     # And the verifier itself is nowhere in the authorization request.
     assert "code_verifier" not in params
     assert run_flow(client, both).headers["location"] == "/auth/oidc/complete"
+
+
+# --- 8: the single-use state ledger has no flush primitive -----------------
+
+
+def test_the_state_ledger_cannot_be_flushed_by_filling_it(oidc_client, idp):
+    """Finding 8. A flush primitive on a single-use ledger *is* the bypass.
+
+    The old ledger cleared itself wholesale on reaching its bound, so "single
+    use" held only until an attacker had redeemed enough states to trip the
+    flush — at which point the state they were holding was forgotten and
+    replayable. Eviction is now FIFO, so the state that just went in is the
+    last one to leave, not the first.
+    """
+    ledger = oidc_routes._StateLedger(maximum=64)
+    states = [f"state-{i}" for i in range(100)]
+    for state in states:
+        assert ledger.claim(state) is True
+
+    # Overflowing the bound by 36 must cost 36 entries, not all 64. Under the
+    # old wholesale clear it cost every entry the moment the bound was hit, so
+    # a state redeemed one request earlier was replayable.
+    still_remembered = [s for s in states[-63:] if ledger.claim(s) is False]
+    assert len(still_remembered) == 63, (
+        f"only {len(still_remembered)} of the 63 most recent states survived; "
+        "the ledger flushed rather than evicted"
+    )
+    assert len(ledger) <= 64
+
+
+def test_production_exposes_no_way_to_empty_the_ledger(oidc_client):
+    """Finding 8. The flush the test suite used to call is gone entirely."""
+    assert not hasattr(oidc_routes, "reset_state_store")
+    assert not hasattr(oidc_routes, "_used_states")
+    ledger = oidc_routes._state_ledger
+    assert not [
+        name
+        for name in dir(ledger)
+        if not name.startswith("_") and name in ("clear", "reset", "flush", "drop")
+    ]
+
+
+def test_a_state_is_still_single_use_end_to_end(oidc_client, idp):
+    """The property the ledger exists for, through the real routes."""
+    login = oidc_client.get("/auth/oidc/login", follow_redirects=False)
+    callback = idp.authorize(login.headers["location"])
+    split = urlsplit(callback)
+    first = oidc_client.get(f"{split.path}?{split.query}", follow_redirects=False)
+    assert first.headers["location"] == "/auth/oidc/complete"
+    second = oidc_client.get(f"{split.path}?{split.query}", follow_redirects=False)
+    assert second.headers["location"] == "/?login_error=oidc_state"
