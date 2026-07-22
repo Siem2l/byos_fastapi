@@ -699,10 +699,11 @@ def test_a_discovery_outage_leaves_the_secret_form_working(oidc_client):
     assert oidc_client.get("/rotation").status_code == 200
 
 
-def test_the_callback_is_throttled_like_the_secret_mint(oidc_client, idp):
-    from trmnl_server.routes import auth as auth_module
+def test_the_callback_is_throttled_on_its_own_budget(oidc_client, idp):
+    """Throttled like the secret mint, but never *out of* the mint's budget."""
+    from trmnl_server.routes import oidc as oidc_routes
 
-    limit = auth_module.MINT_FAIL_LIMIT
+    limit = oidc_routes.CALLBACK_BUDGET.per_source_limit
     codes = []
     for _ in range(limit + 3):
         response = oidc_client.get(
@@ -714,12 +715,12 @@ def test_the_callback_is_throttled_like_the_secret_mint(oidc_client, idp):
 
 
 def test_a_successful_oidc_login_clears_the_failure_counter(oidc_client, idp):
-    from trmnl_server.routes import auth as auth_module
+    from trmnl_server.routes import oidc as oidc_routes
 
-    for _ in range(auth_module.MINT_FAIL_LIMIT - 1):
+    for _ in range(oidc_routes.CALLBACK_BUDGET.per_source_limit - 1):
         oidc_client.get("/auth/oidc/callback?code=x&state=y", follow_redirects=False)
     assert run_flow(oidc_client, idp).headers["location"] == "/auth/oidc/complete"
-    assert auth_module.MINT_BUDGET.tracked("testclient") == 0
+    assert oidc_routes.CALLBACK_BUDGET.tracked("testclient") == 0
 
 
 # --- provider variation ---------------------------------------------------
