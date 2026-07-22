@@ -71,7 +71,14 @@ def test_display_cycle_serves_1bit_bmp(client):
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["refresh_rate"] == 1800
+    # The panel is told the *screen's own* cadence, not a global one —
+    # which screen it gets depends on the rotation, so assert against the
+    # registry rather than pinning a slug that a new screen would change.
+    from trmnl_server.screens import REGISTRY
+
+    assert body["refresh_rate"] in {
+        cls.refresh_seconds for cls in REGISTRY.values()
+    }
     name = body["filename"]
     assert body["image_url"] == f"https://trmnl.example/image/{name}"
 
@@ -204,8 +211,15 @@ def test_display_log_entry_omits_the_frame_nonce(ui_client):
     text = ui_client.get("/server/log?limit=200").text
     assert name not in text
     assert ".bmp" not in text
-    # The useful half is still there.
-    assert "screen=readiness" in text
+    # The useful half is still there: which screen, not which frame. The
+    # slug is whichever one the rotation served, so it is checked against
+    # the registry rather than hard-coded.
+    import re
+
+    from trmnl_server.screens import available
+
+    served = re.search(r"screen=(\S+)", text)
+    assert served and served.group(1) in available()
 
 
 def test_log_entries_do_not_carry_the_full_mac(ui_client):
