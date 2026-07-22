@@ -89,9 +89,10 @@
 
   // Control-plane auth.
   //
-  // The Pangolin edge puts Authentik in front of everything outside /api/*
-  // and /image/*, but it forwards no identity to the backend and the backend
-  // cannot tell an SSO'd request from a bypassed one, so the server also
+  // A reverse proxy may put SSO in front of everything outside /api/* and
+  // /image/*, but it typically forwards no identity to the backend and the
+  // backend cannot tell an SSO'd request from a bypassed one, so the server
+  // also
   // demands a session cookie of its own on /rotation, /devices, /status and
   // /server/* (see routes/auth.py). The cookie is HttpOnly — this file can
   // never read it, and the UI secret goes straight from the login input into

@@ -5,8 +5,9 @@ ASCII; anything else raises `TypeError: comparing strings with non-ASCII
 characters is not supported`. Every secret this app checks arrives from the
 network — the panel's `Access-Token` header, the UI secret in a header or a
 JSON body, the signature half of a session cookie — and the `Access-Token`
-path is reachable from the open internet, because the Pangolin edge bypasses
-SSO for `/api/*` so an ESP32 can talk to it. So
+path is reachable from the open internet on any deployment that puts a
+reverse proxy in front, because `/api/*` has to bypass whatever the proxy
+enforces so an ESP32 can talk to it at all. So
 
     curl -H 'Access-Token: café' https://trmnl.example/api/display
 

@@ -1,27 +1,27 @@
 """App-owned session auth for the browser control plane.
 
-Why the app authenticates at all, when the Pangolin edge already puts
-Authentik SSO in front of everything outside `/api/*` and `/image/*`:
+Why the app authenticates at all, on a deployment that already puts a
+reverse proxy with SSO in front of everything outside `/api/*` and `/image/*`:
 
-* **The edge forwards no identity.** Pangolin 1.19.4 has no
-  `Remote-User`-style header injection and no configuration for one; the
-  authenticated user object it builds is consumed by badger, an external
-  Traefik plugin, and the generated middleware exposes exactly six fields,
-  none of them a header name. So there is nothing for the backend to read.
-* **The backend cannot tell SSO from bypass.** One resource, one target:
-  `/api/display` (bypassed) and `/status` (SSO'd) arrive on the same
-  `127.0.0.1:8095` socket via the same router and service. The only
-  per-resource header facility is a *router*-level static middleware, which
-  runs on the bypassed prefixes too — so a shared secret injected there
-  proves "came through the edge", never "passed Authentik", and nothing
-  strips a client-supplied copy of it on the bypassed path.
+* **The edge may forward no identity.** Several popular reverse proxies have
+  no `Remote-User`-style header injection at all: the authenticated user
+  object is consumed internally by a plugin and never becomes a header the
+  backend could read. So there may be nothing to read.
+* **The backend cannot tell SSO from bypass.** One host, one upstream:
+  `/api/display` (bypassed, because an ESP32 cannot do SSO) and `/status`
+  (SSO'd) arrive on the same loopback socket via the same route and service.
+  Where a per-route static header *is* available it is usually attached at
+  the router level, which runs on the bypassed prefixes too — so a shared
+  secret injected there proves "came through the proxy", never "passed the
+  IdP", and nothing strips a client-supplied copy of it on the bypassed
+  path.
 
 Therefore: an app-owned, HMAC-signed, `SameSite=Strict`, HttpOnly cookie,
 minted by `POST /auth/session` against a secret this app owns
 (`TRMNL_UI_TOKEN_FILE`), enforced as one router-level dependency in
-`routes/api.py`. Edge SSO stays as the outer gate; this is the inner one,
-and it is the one that survives an edge misconfiguration — a broadened
-bypass rule, `sso-enabled` flipped off, or a route accidentally registered
+`routes/api.py`. Edge SSO stays as the outer gate where there is one; this
+is the inner one, and it is the one that survives an edge misconfiguration —
+a broadened bypass rule, SSO switched off, or a route accidentally registered
 under `/api/`.
 
 Deliberately *not* the panel's Access-Token. A compromise of the panel
@@ -72,7 +72,7 @@ _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # --- throttling for unauthenticated routes ---------------------------------
 #
 # `POST /auth/session` is an unauthenticated oracle for the UI secret. It is
-# nominally behind Authentik, but the premise of this whole module is that the
+# nominally behind an edge IdP, but the premise of this whole module is that the
 # app cannot tell an SSO'd request from a bypassed one, so it is bounded as
 # though it were exposed. Only *failures* are counted, and a success clears
 # the caller's counter: an operator who fat-fingers the secret once and then
@@ -182,9 +182,9 @@ MINT_BUDGET = RateBudget(
 def client_source(request: Request) -> str:
     """Client address, or a single shared bucket when there is none.
 
-    Behind Pangolin every request arrives from the Newt tunnel, so in
-    production this is frequently one address for everyone — which is why
-    the global counter exists and is not merely a backstop.
+    Behind a reverse proxy or a tunnel every request arrives from one
+    address, so in production this is frequently a single bucket for everyone
+    — which is why the global counter exists and is not merely a backstop.
     """
     client = request.client
     return client.host if client and client.host else "unknown"
@@ -285,7 +285,7 @@ def _same_origin(request: Request) -> bool:
         # controls", which any request that can set both headers satisfies —
         # a rebound DNS name, a misconfigured upstream that forwards Host
         # verbatim, a proxy honouring X-Forwarded-Host. TRMNL_BASE_URL is set
-        # by the NixOS module and is the one origin this deployment has.
+        # by the deployment and is the one origin this server has.
         return origin == configured
     # No TRMNL_BASE_URL: a source checkout or a LAN box with no fixed name,
     # where there is nothing to pin to but the URL the request arrived on.

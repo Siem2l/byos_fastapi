@@ -1,8 +1,8 @@
 """FastAPI entrypoint and CLI for the TRMNL BYOS panel server.
 
 CLI: `trmnl-server serve`, `trmnl-server screens`, `trmnl-server preview`.
-The subcommand shape deliberately matches the previous stdlib server so the
-NixOS module's ExecStart carries over unchanged.
+The subcommand shape deliberately matches the previous stdlib server so an
+existing unit file's ExecStart carries over unchanged.
 """
 
 from __future__ import annotations
@@ -32,8 +32,9 @@ from .screens import available
 
 logger = config.logger
 
-# The firmware's entire surface under /api/. The Pangolin edge bypasses SSO
-# for /api/* because an ESP32 cannot follow an SSO redirect, so anything
+# The firmware's entire surface under /api/. A reverse proxy in front of this
+# server has to bypass /api/* because an ESP32 cannot follow an SSO redirect
+# and cannot hold a cookie, so anything
 # registered under this prefix is reachable from the open internet with
 # whatever credentials the route itself demands and nothing more. This list
 # is the allowlist enforced by `_assert_route_invariants()`; adding to it is
@@ -156,9 +157,9 @@ def _assert_route_invariants(app: FastAPI) -> None:
     Two invariants that were previously only comments:
 
     1. Nothing but the firmware's fixed device surface may live under
-       `/api/`, because the edge bypasses SSO for that whole prefix. A
-       browser endpoint registered there would silently lose its Authentik
-       gate.
+       `/api/`, because a proxy in front of this server has to bypass that
+       whole prefix for the panel's sake. A browser endpoint registered
+       there would silently lose the outer gate.
     2. Every control-plane route must carry `require_ui_session`. The
        dependency is attached to the router, so this holds by construction —
        this asserts that it *stayed* attached.
@@ -182,10 +183,11 @@ def _assert_route_invariants(app: FastAPI) -> None:
     for path, _route in collected:
         if _under_api(path) and path not in _DEVICE_API_PATHS:
             raise RuntimeError(
-                f"route {path!r} is registered under /api/, which the Pangolin "
-                "edge bypasses SSO for. Control-plane routes must live "
-                "outside /api/ (see routes/api.py). If this really is a "
-                "firmware endpoint, add it to _DEVICE_API_PATHS explicitly."
+                f"route {path!r} is registered under /api/, the prefix a "
+                "reverse proxy has to bypass authentication for so the panel "
+                "can talk. Control-plane routes must live outside /api/ (see "
+                "routes/api.py). If this really is a firmware endpoint, add "
+                "it to _DEVICE_API_PATHS explicitly."
             )
 
     guarded = {getattr(route, "path", "") for route in api_router.routes}

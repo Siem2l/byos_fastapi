@@ -9,10 +9,10 @@ image handling exists to provide:
   `?token=` it accepts is optional — `_device_context_for_image_request()`
   falls back to `get_device_state_from_request()`, so an anonymous GET with
   no token still returns a frame under the `default` device. The firmware
-  fetches `image_url` with no auth header at all, and the Pangolin edge
-  config bypasses SSO for `/image/*` for exactly that reason, so on this
-  deployment those URLs would have been an unauthenticated read of health
-  data from the open internet. `routes/panel.py` keeps ownership of
+  fetches `image_url` with no auth header at all, which is why a reverse
+  proxy in front of this server has to bypass authentication for `/image/*`
+  — so on any exposed deployment those URLs were an unauthenticated read of
+  health data from the open internet. `routes/panel.py` keeps ownership of
   `/image/{name}`, where the only servable names are the
   `screen-NNN-<16 hex>.bmp` nonces it just generated and then prunes.
 
@@ -86,11 +86,11 @@ def serve_generated(path: str, request: Request) -> Response:
     the same Garmin render — one drawn on demand, one drawn by the plugin
     scheduler — so an unauthenticated `/generated/...` is not a smaller hole
     than an unauthenticated `/preview/...`, it is the same hole reached by a
-    sibling route. Relying on the edge alone to tell them apart is exactly
+    sibling route. Relying on an edge alone to tell them apart is exactly
     the assumption `routes/auth.py` exists to reject: the app cannot see
-    whether Authentik ran, one broadened bypass rule covers this prefix, and
-    the rule that already exists (`/image/*`) is one character away from
-    matching `/images/`.
+    whether the proxy authenticated anyone, one broadened bypass rule covers
+    this prefix, and the rule that already has to exist (`/image/*`) is one
+    character away from matching `/images/`.
 
     Two credentials are accepted, and both are ones the caller already has:
     a control-plane session cookie (what the UI's `<img>` tags send —
@@ -100,9 +100,9 @@ def serve_generated(path: str, request: Request) -> Response:
     exactly as `/preview` does — one rule, not two.
 
     This replaces `app.mount("/generated", StaticFiles(...))`. The mount was
-    not an internet-facing hole — `/generated/*` matches neither of the
-    edge's bypass rules (`/api/*`, `/image/*`), so it sits behind Authentik,
-    and it exposes neither the panel's nonce frames nor `trmnl.db`, both of
+    not an internet-facing hole — `/generated/*` matches neither bypass rule
+    a proxy needs (`/api/*`, `/image/*`), so it sits behind whatever that
+    proxy enforces, and it exposes neither the panel's nonce frames nor `trmnl.db`, both of
     which live in `<state_dir>` itself rather than `<state_dir>/generated`.
     What it *was* is a standing grant on a directory: whatever a future
     plugin writes there becomes HTTP-reachable with no review step, at a

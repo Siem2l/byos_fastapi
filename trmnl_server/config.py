@@ -73,8 +73,8 @@ EINK_TONE_GAMMA = 1.0
 CONFIG_DIR = getcwd()
 
 # Upstream resolves every runtime directory relative to the working
-# directory. Under the NixOS unit there is no WorkingDirectory and
-# DynamicUser starts in `/`, so `web` and `var/generated` would resolve to
+# directory. Under a hardened systemd unit there may be no WorkingDirectory
+# and `DynamicUser` starts in `/`, so `web` and `var/generated` resolve to
 # `/web` and `/var/generated` — neither of which exists, and both of which
 # `ProtectSystem = "strict"` makes unwritable. For the static root that is
 # fatal: StaticFiles() raises at construction when its directory is
@@ -333,9 +333,9 @@ _refresh_path_constants()
 # ---------------------------------------------------------------------------
 # Panel (BYOS) configuration.
 #
-# Entirely env-var driven: the NixOS module is the only intended writer of
-# these variables, and the names are load-bearing — modules/services/web/
-# trmnl.nix sets them verbatim. The defaults exist so `preview` works from a
+# Entirely env-var driven: the deployment's unit or compose file is the only
+# intended writer of these variables, and the names are load-bearing because
+# that file sets them verbatim. The defaults exist so `preview` works from a
 # source checkout.
 # ---------------------------------------------------------------------------
 
