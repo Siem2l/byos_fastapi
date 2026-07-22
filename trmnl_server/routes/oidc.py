@@ -47,8 +47,11 @@ reason:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import secrets
+import threading
 import time
 from typing import Any
 
@@ -90,17 +93,19 @@ _STATE_KEY_CONTEXT = b"trmnl-oidc-state-v1"
 # proxy that retries), where the cookie is still in flight.
 _USED_STATE_MAX = 1024
 _used_states: dict[str, float] = {}
+# Sync `def` handlers run in FastAPI's threadpool, so two callbacks carrying
+# the same state really can be in `_claim_state` at once. Without this lock
+# the check-then-set is a race and "single use" means "usually single use".
+_used_lock = threading.Lock()
 
 
 def reset_state_store() -> None:
     """Drop the single-use state ledger. Called by the test suite."""
-    _used_states.clear()
+    with _used_lock:
+        _used_states.clear()
 
 
 def _state_key(secret: str) -> bytes:
-    import hashlib
-    import hmac
-
     return hmac.new(secret.encode("utf-8"), _STATE_KEY_CONTEXT, hashlib.sha256).digest()
 
 
@@ -140,8 +145,10 @@ def _unpack_state(secret: str, raw: str) -> dict[str, Any] | None:
     if not secret_equal(signature, expected):
         return None
     try:
+        # binascii.Error and UnicodeDecodeError are both ValueError, so this
+        # covers a malformed base64 body, non-UTF-8 bytes and invalid JSON.
         payload = json.loads(oidc_module.b64url_decode(body))
-    except Exception:
+    except ValueError:
         return None
     if not isinstance(payload, dict):
         return None
@@ -159,16 +166,17 @@ def _unpack_state(secret: str, raw: str) -> dict[str, Any] | None:
 def _claim_state(state: str) -> bool:
     """True the first time `state` is redeemed, False every time after."""
     now = time.monotonic()
-    for key in [k for k, expiry in _used_states.items() if expiry <= now]:
-        _used_states.pop(key, None)
-    if state in _used_states:
-        return False
-    if len(_used_states) >= _USED_STATE_MAX:
-        # Bounded rather than unbounded: the entries expire in STATE_TTL
-        # anyway, and a flood of unredeemed states must not be a memory leak.
-        _used_states.clear()
-    _used_states[state] = now + STATE_TTL
-    return True
+    with _used_lock:
+        for key in [k for k, expiry in _used_states.items() if expiry <= now]:
+            _used_states.pop(key, None)
+        if state in _used_states:
+            return False
+        if len(_used_states) >= _USED_STATE_MAX:
+            # Bounded rather than unbounded: the entries expire in STATE_TTL
+            # anyway, and a flood of unredeemed states must not become a leak.
+            _used_states.clear()
+        _used_states[state] = now + STATE_TTL
+        return True
 
 
 def _set_state_cookie(response: Response, value: str) -> None:

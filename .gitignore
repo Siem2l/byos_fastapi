@@ -13,4 +13,3 @@ web/*.bmp
 web/*.png
 *.pyc
 var/
-.oidc-dev/
