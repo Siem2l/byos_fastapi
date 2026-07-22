@@ -1,7 +1,8 @@
 # Design: native OIDC login for BYOS
 
-**Status:** proposal · **Target:** `usetrmnl/byos_fastapi` (developed in
-`Siem2l/byos_fastapi`) · **Written** 2026-07-22
+**Status:** implemented on `feat/oidc` (phases 1-5); phase 6 (upstream PR)
+pending · **Target:** `usetrmnl/byos_fastapi` (developed in
+`Siem2l/byos_fastapi`) · **Written** 2026-07-22 · **Updated** 2026-07-22
 
 ## Why
 
@@ -39,6 +40,17 @@ OIDC code flow ──────┘
 Both paths stay available. An operator with no IdP keeps the overlay; an
 operator with Authentik/Keycloak/Authelia/Pocket ID gets real SSO. Neither is
 mandatory: with neither configured, `require_ui_session` stays fail-closed.
+
+> **Implementation note.** "Neither is mandatory" did not hold as written.
+> The cookie's HMAC key was derived from `TRMNL_UI_TOKEN_FILE`, so an
+> OIDC-only deployment had nothing to sign a session with and answered 503 to
+> every control-plane request *after a flawless code flow*.
+> `Config.session_secret()` now returns the UI secret when there is one and
+> the OIDC client secret otherwise. `require_ui_session` stays fail-closed —
+> the predicate simply took a second input. Rotating either file invalidates
+> outstanding sessions, and on an OIDC-only box the IdP also holds the key
+> material; it can already mint an identity for anyone, so this is not an
+> escalation, but it is why the UI secret stays preferred when both exist.
 
 ## Zero new dependencies
 
@@ -114,24 +126,89 @@ configured, the secret overlay when it is not, and both when both are.
   caller-supplied `redirect_uri` or `next` without validating it against the
   configured origin — open-redirect is the classic bug here.
 - **`nonce`** sent and checked against the ID token claim.
-- **Group check fails closed** — a missing or unreadable claim denies.
+- **Group check fails closed** — a missing or unreadable claim denies *when
+  a restriction is configured*. With `TRMNL_OIDC_ALLOWED_GROUPS` unset a
+  missing claim must not deny, or Google — which has no group or role claim
+  of any kind — could never be used.
 - **Discovery is cached but re-fetched on failure**, and a discovery outage
   must not lock out the shared-secret path.
 - **The IdP is never consulted for `/api/*`.** Assert it in tests.
-- Reuse `_same_origin` for CSRF on the callback.
+- ~~Reuse `_same_origin` for CSRF on the callback.~~ **Wrong — see below.**
+
+## Decisions taken during implementation
+
+Five things in the sketch above turned out to be wrong or underspecified.
+Each is a comment in the code as well, because each looks like a mistake
+without the reason.
+
+1. **`_same_origin()` must NOT guard the callback.** The callback is a
+   cross-site-initiated top-level navigation, so a real browser sends
+   `Sec-Fetch-Site: cross-site` — which `_same_origin` returns `False` for —
+   while `curl` sends neither `Sec-Fetch-Site` nor `Origin`, which it returns
+   `True` for. Applying it would refuse every genuine login and admit every
+   scripted one. The callback's CSRF defence is the signed, single-use,
+   verifier-bound `state` cookie, which is what actually binds the response
+   to *this* browser's attempt. `require_ui_session` is unaffected: `GET` is
+   in `_SAFE_METHODS`.
+
+2. **The state cookie is `SameSite=Lax`, not `Strict`.** A `Strict` cookie is
+   not sent on the IdP's return navigation at all, so a Strict state cookie
+   breaks every real login while leaving scripted requests untouched. It is
+   scoped to `path=/auth/oidc` with a 300 s max-age, and it is the *only*
+   relaxed cookie — the session cookie stays `Strict`, asserted in tests.
+
+3. **The callback 302s to a same-origin interstitial, not to `/`.** The
+   freshly-minted `SameSite=Strict` session cookie is not carried on a
+   redirect chain that began cross-site, so a direct 302 to `/` renders a
+   dashboard that reports itself logged out until the operator reloads — a
+   bug indistinguishable from flakiness. `/auth/oidc/complete` navigates to
+   `/` itself, and that hop is same-site-initiated. It also keeps the
+   authorization code out of the address bar and history.
+
+4. **`/auth/oidc/login` takes no parameters at all.** No `next`, no
+   `redirect_uri`, no `return_to`. The redirect URI is derived from
+   `TRMNL_BASE_URL`; the destination is always `/`. That is the whole
+   open-redirect mitigation, and it is free because a single-page dashboard
+   has nowhere else to land. A `TRMNL_OIDC_REDIRECT_URL` outside `base_url`
+   disables the feature rather than being honoured, and OIDC refuses to
+   enable at all without a `base_url` — with no fixed origin there is nothing
+   to build a redirect from and nothing to allowlist it against.
+
+5. **Groups are read from `userinfo` first and the ID token second.**
+   Userinfo is the authoritative source and the one Authelia explicitly
+   steers clients toward; the ID token covers Keycloak's `microprofile-jwt`
+   and Authelia claims policies, which land groups there and nowhere else.
+   First non-absent source wins and the two are never merged, so a
+   deliberately narrowed userinfo response is not widened by a staler ID
+   token. Relatedly, "no claim at all" and "no matching group" are distinct
+   errors: the same symptom with completely different fixes, and collapsing
+   them is what makes a misconfigured Keycloak take an afternoon.
+
+Two smaller ones:
+
+* **Token-endpoint authentication is read from discovery**, preferring
+  `client_secret_basic` and falling back to `client_secret_post`, because
+  Authelia enforces the registered method and a hardcoded
+  `client_secret_post` simply fails there.
+* **A userinfo response with `Content-Type: application/jwt` is refused.**
+  Consuming it would mean parsing a signed assertion and ignoring the
+  signature, which is *not* what §3.1.3.7 item 6 licenses — that covers the
+  token endpoint, not this one. Keycloak and Authelia can both be configured
+  to do it; the README says not to.
 
 ## Phases
 
-1. **Discovery + config** — parse `.well-known`, validate config at startup,
-   log clearly when OIDC is off. Tests with a stubbed discovery document.
-2. **Code flow** — login/callback, PKCE, state, nonce, session mint. Tests
+1. ✅ **Discovery + config** — parse `.well-known`, validate config at
+   startup, log clearly when OIDC is off. Tests with a stubbed discovery
+   document.
+2. ✅ **Code flow** — login/callback, PKCE, state, nonce, session mint. Tests
    against a fake IdP served by FastAPI's own test client; no network.
-3. **Authorization** — group claim matching, fail-closed. Tests for missing
+3. ✅ **Authorization** — group claim matching, fail-closed. Tests for missing
    claim, wrong group, multiple groups.
-4. **UI** — provider button, method reporting, error surfaces that say what
+4. ✅ **UI** — provider button, method reporting, error surfaces that say what
    went wrong ("your account is not in an allowed group") rather than "login
    failed".
-5. **Docs** — `README` section plus a copy-paste config block per provider:
+5. ✅ **Docs** — `README` section plus a copy-paste config block per provider:
    Authentik, Keycloak, Authelia, Pocket ID, Google.
 6. **Upstream PR** — one feature, one branch, docs and tests included.
 
