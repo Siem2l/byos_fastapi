@@ -167,9 +167,14 @@ algorithm at `none`.
 
 Both `/auth/oidc/login` and `/auth/oidc/callback` are rate limited, on
 counters separate from `POST /auth/session`'s, so traffic against one login
-path can never lock you out of the other. Outbound calls to the provider are
-capped at eight concurrent and every response body at 256 KiB, because the
-panel's own endpoints share this process's threadpool and memory.
+path can never lock you out of the other. Those counters are sized so that
+anonymous traffic cannot deny *you* a login — behind a tunnelling reverse
+proxy every request shares one source address, so a tight per-source limit is
+a lockout anyone can trigger for free. What keeps the panel alive under a
+login flood is not the request counter but the cap on concurrent outbound
+calls to the provider: eight at a time, refused rather than queued, with every
+response body capped at 256 KiB, because the panel's own endpoints share this
+process's threadpool and memory.
 
 A discovery outage never locks you out: it disables the OIDC button and
 nothing else. Keep `TRMNL_UI_TOKEN_FILE` configured as a way back in until

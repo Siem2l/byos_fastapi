@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import contextmanager
 from statistics import median
 from urllib.parse import urlsplit
 
@@ -278,32 +279,173 @@ def test_a_distributed_login_flood_does_not_stall_the_device_plane(
     assert max(latencies) < 1.0, f"worst device latency {max(latencies):.3f}s"
 
 
-def test_the_login_endpoint_is_rate_limited(oidc_client, idp):
-    """Finding 1. `/auth/oidc/login` counted nothing at all before."""
-    oidc_routes.LOGIN_BUDGET.reset()
-    limit = oidc_routes.LOGIN_BUDGET.per_source_limit
-    codes = [
-        oidc_client.get("/auth/oidc/login", follow_redirects=False)
-        for _ in range(limit + 5)
-    ]
+@contextmanager
+def _with_login_limits(per_source, global_limit):
+    """Temporarily shrink LOGIN_BUDGET so its *mechanism* can be exercised.
+
+    The production limits are four figures on purpose (below), which is far too
+    many requests to push through a TestClient just to watch a counter trip.
+    Shrinking them tests the counter; the two tests after this one test the
+    numbers.
+    """
+    budget = oidc_routes.LOGIN_BUDGET
+    original = (budget.per_source_limit, budget.global_limit)
+    budget.reset()
+    budget.per_source_limit = per_source
+    budget.global_limit = global_limit
+    try:
+        yield budget
+    finally:
+        budget.per_source_limit, budget.global_limit = original
+        budget.reset()
+
+
+def test_the_login_endpoint_is_still_rate_limited(oidc_client, idp):
+    """Finding 1. `/auth/oidc/login` counted nothing at all before.
+
+    The budget did not go away when it was resized — deleting it is the trap
+    (see `test_the_login_budget_cannot_fill_the_state_ledger`). It still
+    refuses, it still refuses by redirecting rather than queueing, and it still
+    refuses before a state is minted.
+    """
+    with _with_login_limits(8, 1000):
+        codes = [
+            oidc_client.get("/auth/oidc/login", follow_redirects=False)
+            for _ in range(13)
+        ]
     assert all(r.status_code == 302 for r in codes)
-    assert all(
-        "/?login_error=" not in r.headers["location"] for r in codes[:limit]
-    )
-    assert {r.headers["location"] for r in codes[limit:]} == {
+    assert all("/?login_error=" not in r.headers["location"] for r in codes[:8])
+    assert {r.headers["location"] for r in codes[8:]} == {
         "/?login_error=oidc_throttled"
     }
+    # A throttled login mints no state, which is what makes "ledger entries <=
+    # logins allowed" true. If it minted one anyway, the budget would bound
+    # nothing. `_fail()` still *clears* the cookie, so the check is that no
+    # value was handed out, not that the header is absent.
+    for refused in codes[8:]:
+        header = next(
+            (h for h in refused.headers.get_list("set-cookie")
+             if h.startswith(f"{oidc_routes.STATE_COOKIE}=")),
+            f"{oidc_routes.STATE_COOKIE}=",
+        )
+        value = header.split(";")[0].split("=", 1)[1].strip('"')
+        assert value == "", f"a throttled login still minted a state: {header}"
+
+
+# How much anonymous traffic `/auth/oidc/login` might plausibly see from
+# something that is not an attack: a crawler that found the link, a link-
+# preview fetcher, an uptime probe, every browser in the house retrying at once
+# after the IdP came back. A thousand hits in one window is already an absurd
+# over-estimate of all of those put together — and it is 33x the limit this
+# endpoint used to have.
+PLAUSIBLE_ANONYMOUS_FLOOD = 1000
+
+
+def test_a_plausible_anonymous_flood_does_not_deny_a_real_login(oidc_client, idp):
+    """Finding N1. The lockout, which was the cure being worse than the disease.
+
+    `LOGIN_BUDGET` was 30 per source per five minutes. Behind a tunnelling edge
+    — Pangolin/Newt, and `RateBudget`'s own docstring says exactly this — every
+    request arrives from one address, so "per source" is one bucket for
+    everybody and thirty anonymous GETs denied SSO to every operator for five
+    minutes. No credential needed, no cookie, nothing to guess.
+
+    Note that the flood and the legitimate login here share a source address,
+    because that *is* the deployment topology. The whole flood plus a complete
+    round trip has to fit inside the budget with room to spare.
+    """
+    oidc_routes.LOGIN_BUDGET.reset()
+    auth_module.MINT_BUDGET.reset()
+    for _ in range(PLAUSIBLE_ANONYMOUS_FLOOD):
+        response = oidc_client.get("/auth/oidc/login", follow_redirects=False)
+        assert response.status_code == 302
+    oidc_client.cookies.clear()
+
+    # ...and an operator arriving behind all of that still reaches the IdP,
+    # rather than being bounced to `/?login_error=oidc_throttled`.
+    started = oidc_client.get("/auth/oidc/login", follow_redirects=False)
+    assert started.headers["location"].startswith(OIDC_ISSUER), (
+        f"{PLAUSIBLE_ANONYMOUS_FLOOD} anonymous GETs locked a real operator "
+        f"out of SSO: {started.headers['location']} (tracked: "
+        f"{oidc_routes.LOGIN_BUDGET.tracked('testclient')} of "
+        f"{oidc_routes.LOGIN_BUDGET.per_source_limit})"
+    )
+    # ...and completes the round trip and holds a session at the end of it.
+    assert run_flow(oidc_client, idp).headers["location"] == "/auth/oidc/complete"
+    assert oidc_client.get("/status").status_code == 200
+    # With margin left, rather than landing exactly on the line.
+    assert PLAUSIBLE_ANONYMOUS_FLOOD * 2 < oidc_routes.LOGIN_PER_SOURCE_LIMIT
+
+
+def test_the_login_budget_cannot_fill_the_state_ledger(oidc_client, idp, caplog):
+    """Finding N1, the other half — why the budget could not simply be deleted.
+
+    `_StateLedger` bounds itself at `_USED_STATE_MAX` entries and evicts FIFO,
+    and its docstring rests the safety of that on the login limiter: fill the
+    ledger inside one STATE_TTL and it starts dropping *live* states, which is
+    exactly the replay the ledger exists to refuse. So the two are interlocked,
+    and raising one limit without the other reopens the hole.
+
+    The arithmetic, asserted rather than asserted-to:
+
+      * a ledger entry needs a distinct state that `_unpack_state()` accepted,
+        so it needs a signature only `/auth/oidc/login` makes;
+      * a state is accepted only within STATE_TTL of being minted, and its
+        entry is dropped STATE_TTL after being claimed, so every live entry was
+        minted within the last 2 * STATE_TTL;
+      * the budget's window IS STATE_TTL, so at most LOGIN_GLOBAL_LIMIT states
+        exist per STATE_TTL and at most 2 * LOGIN_GLOBAL_LIMIT entries can be
+        live at once.
+    """
+    budget = oidc_routes.LOGIN_BUDGET
+    assert budget.window <= oidc_routes.STATE_TTL, (
+        "a window longer than STATE_TTL breaks the one-to-one step in the "
+        "derivation: more states could be minted per TTL than the limit says"
+    )
+    worst_case = 2 * budget.global_limit
+    assert worst_case < oidc_routes._USED_STATE_MAX, (
+        f"{worst_case} live states are reachable against a ledger bound of "
+        f"{oidc_routes._USED_STATE_MAX}"
+    )
+    # Derived, not coincidental: raising the limiter raises the ledger with it.
+    assert oidc_routes._USED_STATE_MAX == 4 * budget.global_limit
+
+    # Now drive a real ledger to that worst case and check the claim holds: no
+    # eviction, and the very first state is still remembered as spent.
+    ledger = oidc_routes._StateLedger()
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        for i in range(worst_case):
+            assert ledger.claim(f"state-{i}") is True
+    assert len(ledger) == worst_case
+    assert not [r for r in caplog.records if "evicting an unexpired state" in r.message]
+    assert ledger.claim("state-0") is False, "a live state was evicted and is replayable"
+    assert ledger.claim(f"state-{worst_case - 1}") is False
+
+    # And the bound is real rather than decorative: one entry past it *does*
+    # evict, which is the thing the arithmetic above keeps out of reach.
+    small = oidc_routes._StateLedger(maximum=4)
+    for i in range(5):
+        assert small.claim(f"s{i}") is True
+    assert small.claim("s0") is True, "the FIFO bound is not evicting at all"
 
 
 def test_a_login_flood_does_not_lock_out_the_secret_login(oidc_client, idp):
-    """Finding 1 + 2. Throttling the SSO path must cost the other path nothing."""
-    oidc_routes.LOGIN_BUDGET.reset()
+    """Finding 1 + 2. Throttling the SSO path must cost the other path nothing.
+
+    Even with the OIDC budget fully spent — forced here, since the real limit
+    is too high to reach by hand — the shared-secret form is untouched.
+    """
     auth_module.MINT_BUDGET.reset()
-    for _ in range(oidc_routes.LOGIN_BUDGET.per_source_limit + 20):
-        oidc_client.get("/auth/oidc/login", follow_redirects=False)
-    assert oidc_client.post(
-        "/auth/session", json={"token": UI_TOKEN}
-    ).status_code == 204
+    with _with_login_limits(5, 5):
+        for _ in range(25):
+            oidc_client.get("/auth/oidc/login", follow_redirects=False)
+        assert oidc_client.get(
+            "/auth/oidc/login", follow_redirects=False
+        ).headers["location"] == "/?login_error=oidc_throttled"
+        assert oidc_client.post(
+            "/auth/session", json={"token": UI_TOKEN}
+        ).status_code == 204
 
 
 # --- 2: a callback flood must not spend the shared-secret budget -----------

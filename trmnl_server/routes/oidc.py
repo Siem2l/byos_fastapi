@@ -77,6 +77,16 @@ logger = config_module.logger
 
 router = APIRouter()
 
+STATE_COOKIE = "trmnl_oidc_state"
+# Five minutes is long enough for a password plus a TOTP prompt and short
+# enough that an abandoned tab is not a standing credential.
+STATE_TTL = 300
+STATE_VERSION = "o1"
+# A *different* key context from the session cookie's, so a session cookie can
+# never be replayed as a state token or vice versa even though both are signed
+# with the same underlying secret.
+_STATE_KEY_CONTEXT = b"trmnl-oidc-state-v1"
+
 # --- throttling ------------------------------------------------------------
 #
 # Two budgets, and neither is the shared-secret form's.
@@ -88,41 +98,83 @@ router = APIRouter()
 # attacker who cannot guess the secret could still deny it to everyone. The
 # two paths are different oracles over different secrets, so they get
 # different accounting; a failure on one must never cost the other.
-#
-# `LOGIN_BUDGET` counts *every* `/auth/oidc/login`, not just failures, because
-# a successful login is precisely what costs the server an outbound round trip.
-# This is the first of the two bounds on that endpoint; `oidc.OUTBOUND_LIMIT`
-# is the second and is the one that holds when the flood is distributed.
 CALLBACK_BUDGET = RateBudget(
     "oidc-callback",
     window=MINT_RATE_WINDOW,
     per_source_limit=10,
     global_limit=100,
 )
-# A human clicking "Sign in with ..." generates one of these. Thirty per five
-# minutes per client is a fat margin over a person retrying a failed login,
-# and three hundred globally is far more SSO logins than a panel server sees.
+
+# `LOGIN_BUDGET` counts *every* `/auth/oidc/login`, not just the failures.
+#
+# It is **not** what keeps the panel alive under a login flood, and sizing it
+# as though it were is how it came to deny SSO to every operator after thirty
+# anonymous GETs. What protects the device plane is `oidc.OUTBOUND_LIMIT`: a
+# non-blocking semaphore that lets at most eight of anyio's forty threadpool
+# workers be inside an IdP call and refuses the ninth immediately. Measured
+# against a 64-thread flood with an IdP stalling one second per call:
+#
+#     both guards                       /api/display median  30.1 ms, worst  101.7 ms
+#     this budget off, semaphore on     /api/display median  37.5 ms, worst  102.5 ms
+#     neither                           /api/display median 944.4 ms, worst 1008.1 ms
+#
+# The semaphore is the whole effect; this budget's contribution to device
+# latency is inside the noise. Meanwhile a per-source budget behind a
+# tunnelling edge is one bucket for *everybody* — see `RateBudget`'s own
+# docstring — so a low limit here is a lockout primitive that any anonymous
+# caller can pull, for free, with no credential. A lockout an anonymous caller
+# can trigger is a worse failure than the flood it was meant to stop.
+#
+# So the budget has exactly one job left: stop `_StateLedger` from ever being
+# forced to evict a *live* state, which is the only way a redeemed state
+# becomes replayable. The arithmetic that keeps that true, worst case:
+#
+#   1. A ledger entry exists only for a state `_unpack_state()` accepted,
+#      which needs a signature made with this server's own secret — i.e. one
+#      `/auth/oidc/login` minted. A throttled login mints none (`_fail()`
+#      returns before the state is generated), so:
+#          ledger entries created ≤ logins allowed.
+#   2. Each entry needs a *distinct* state: claiming the same one twice is
+#      precisely what the ledger refuses, and a refusal inserts nothing.
+#   3. A state is only accepted within STATE_TTL of being minted (its signed
+#      `exp`), and its ledger entry is dropped STATE_TTL after it was claimed
+#      — expired entries first, before the membership test. So every entry
+#      live at time T was minted somewhere in (T - 2·STATE_TTL, T].
+#   4. This budget's window IS STATE_TTL, so at most LOGIN_GLOBAL_LIMIT states
+#      are minted per STATE_TTL and therefore
+#          live ledger entries ≤ 2 · LOGIN_GLOBAL_LIMIT = 8192,
+#      against a bound of `_USED_STATE_MAX` = 16384. Twice the headroom the
+#      worst case needs, and the eviction branch is unreachable.
+#
+# `_USED_STATE_MAX` is *derived* from LOGIN_GLOBAL_LIMIT below rather than
+# asserted against it, so the two cannot drift apart in a later edit — raising
+# the limit raises the ledger with it.
+#
+# On the other side: 4096 per five minutes is ~13.6 requests/second sustained
+# before anyone is refused, against a legitimate rate of one request per human
+# clicking "Sign in with ...". Nothing incidental — a crawler, a link-preview
+# fetch, an uptime probe, every browser in the house retrying a dead IdP at
+# once — comes within two orders of magnitude of that. Anything that does is a
+# deliberate flood, and a deliberate flood is already being absorbed by
+# `OUTBOUND_LIMIT` on the device plane's behalf and by the IdP's own rate
+# limiting on the provider's.
+LOGIN_RATE_WINDOW = float(STATE_TTL)
+LOGIN_GLOBAL_LIMIT = 4096
+# Half the global budget: where sources really are distinct (a LAN box, a
+# directly-exposed host) one client cannot spend everybody's. Behind a tunnel
+# the two collapse into a single 2048-per-five-minute bucket, which is still
+# ~6.8 anonymous requests/second before an operator could notice anything.
+LOGIN_PER_SOURCE_LIMIT = LOGIN_GLOBAL_LIMIT // 2
 LOGIN_BUDGET = RateBudget(
     "oidc-login",
-    window=MINT_RATE_WINDOW,
-    per_source_limit=30,
-    global_limit=300,
+    window=LOGIN_RATE_WINDOW,
+    per_source_limit=LOGIN_PER_SOURCE_LIMIT,
+    global_limit=LOGIN_GLOBAL_LIMIT,
 )
 
-STATE_COOKIE = "trmnl_oidc_state"
-# Five minutes is long enough for a password plus a TOTP prompt and short
-# enough that an abandoned tab is not a standing credential.
-STATE_TTL = 300
-STATE_VERSION = "o1"
-# A *different* key context from the session cookie's, so a session cookie can
-# never be replayed as a state token or vice versa even though both are signed
-# with the same underlying secret.
-_STATE_KEY_CONTEXT = b"trmnl-oidc-state-v1"
-
-# Every state entry lives STATE_TTL seconds and `/auth/oidc/login` is rate
-# limited, so this bounds the ledger at far more entries than the login budget
-# can produce in one TTL. Sized generously on purpose: see `_StateLedger`.
-_USED_STATE_MAX = 16384
+# Four times the login budget, i.e. twice the worst case derived above. Do not
+# hard-code this: the point is that it moves with the limiter. See `_StateLedger`.
+_USED_STATE_MAX = 4 * LOGIN_GLOBAL_LIMIT
 
 
 class _StateLedger:
@@ -143,8 +195,13 @@ class _StateLedger:
     So eviction is FIFO by insertion, which is very nearly by expiry since
     every entry has the same TTL — the entry dropped is the one closest to
     ageing out anyway — and the bound is high enough that the rate limiter on
-    `/auth/oidc/login` cannot fill it within one TTL. The test suite gets a
-    fresh instance rather than a flush; `reset_state_store()` is gone.
+    `/auth/oidc/login` cannot fill it within one TTL. That last clause is a
+    load-bearing coupling, not a remark: `_USED_STATE_MAX` is computed from
+    `LOGIN_GLOBAL_LIMIT`, and the arithmetic proving 2·LOGIN_GLOBAL_LIMIT is
+    the true worst case is written out above that constant. Deleting the
+    limiter, or raising it without raising this bound, reopens the replay this
+    ledger exists to close. The test suite gets a fresh instance rather than a
+    flush; `reset_state_store()` is gone.
     """
 
     def __init__(self, maximum: int = _USED_STATE_MAX) -> None:
@@ -296,9 +353,10 @@ def oidc_login(request: Request) -> Response:
     if not secret:  # pragma: no cover - implied by configuration_problem
         return _fail("oidc_disabled")
 
-    # Before any outbound work, and before any allocation: this endpoint is
-    # unauthenticated and the panel shares the threadpool it would otherwise
-    # spend. See the LOGIN_BUDGET comment.
+    # Before the state is minted, because minting is what this budget bounds:
+    # every allowed login is one more entry the single-use ledger may have to
+    # hold. The device plane's protection is `oidc.OUTBOUND_LIMIT`, further
+    # down inside `discovery()`, not this. See the LOGIN_BUDGET comment.
     source = client_source(request)
     if not LOGIN_BUDGET.allowed(source):
         logger.warning("/auth/oidc/login throttled for %s", source)

@@ -156,9 +156,18 @@ each is now an executable test in `tests/test_oidc_security.py`:
   from one that honours it. `plain` is never selected even when offered.
 - **The device plane cannot be starved by the control plane.** Every route is
   a sync `def` sharing one 40-worker threadpool with `/api/display`, so
-  `/auth/oidc/login` — unauthenticated, and doing outbound work — is rate
-  limited, its outbound calls are capped at eight concurrent, and discovery is
-  single-flight.
+  `/auth/oidc/login` — unauthenticated, and doing outbound work — has its
+  outbound calls capped at eight concurrent (refused, not queued), and
+  discovery is single-flight. Measured under a 64-thread flood against an IdP
+  stalling a second per call, that cap is what holds `/api/display` at ~30 ms;
+  the request-count budget on the same endpoint contributes nothing to it.
+- **The request-count budget on `/auth/oidc/login` exists for the state
+  ledger, not for the panel.** It is sized so that no realistic anonymous
+  volume can deny an operator a login (behind a tunnelling edge every caller
+  shares one source address, so a tight per-source limit is a free lockout for
+  anyone) while still capping how many single-use states can exist inside one
+  `STATE_TTL`. `_USED_STATE_MAX` is derived from the limit so the two cannot
+  drift; the arithmetic is written out above `LOGIN_GLOBAL_LIMIT`.
 - **The OIDC paths do not share the shared-secret login's failure budget.**
   A hundred free cross-site GETs on the callback used to exhaust it and lock
   every operator out of `POST /auth/session`.
