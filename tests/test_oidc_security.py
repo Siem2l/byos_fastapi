@@ -364,3 +364,52 @@ def test_the_advertised_issuer_is_accepted_as_well_as_the_configured_one(
     )
     install_idp(authentik)
     assert run_flow(client, authentik).headers["location"] == "/auth/oidc/complete"
+
+
+# --- 4: userinfo is bound to the ID token (OIDC Core 5.3.2) ----------------
+
+
+@pytest.mark.parametrize(
+    "userinfo_claims,why",
+    [
+        (
+            {
+                "sub": "mallory",
+                "preferred_username": "mallory",
+                "groups": ["trmnl-admins"],
+            },
+            "the original PoC A: userinfo names a different subject entirely",
+        ),
+        ({}, "PoC A2: a completely empty userinfo response"),
+        ({"preferred_username": "alice", "groups": ["trmnl-admins"]},
+         "claims but no sub at all"),
+        ({"sub": "", "groups": ["trmnl-admins"]}, "an empty sub"),
+        ({"sub": None, "groups": ["trmnl-admins"]}, "a null sub"),
+        ({"sub": ["alice"], "groups": ["trmnl-admins"]}, "a non-string sub"),
+    ],
+)
+def test_userinfo_must_match_the_id_token_subject(
+    oidc_client, idp, userinfo_claims, why
+):
+    """Finding 4, inverted PoCs A and A2.
+
+    Identity in this design comes from `userinfo`; the ID token is what binds
+    the response to this login attempt. Unbound, the two are unrelated and the
+    group decision is made about whoever `userinfo` names.
+    """
+    idp.userinfo_claims = userinfo_claims
+    response = run_flow(oidc_client, idp, sub="alice")
+    assert response.headers["location"] == "/?login_error=oidc_subject", why
+    assert "trmnl_ui" not in response.headers.get("set-cookie", "")
+    assert oidc_client.get("/status").status_code == 401
+
+
+def test_a_matching_userinfo_subject_still_logs_in(oidc_client, idp):
+    """The binding must not break the ordinary case it exists to protect."""
+    idp.userinfo_claims = {
+        "sub": "alice", "preferred_username": "alice", "groups": ["trmnl-admins"]
+    }
+    assert run_flow(oidc_client, idp, sub="alice").headers[
+        "location"
+    ] == "/auth/oidc/complete"
+    assert oidc_client.get("/status").status_code == 200

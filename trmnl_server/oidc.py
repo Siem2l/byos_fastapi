@@ -111,6 +111,7 @@ LOGIN_ERROR_CODES = frozenset({
     "oidc_userinfo_jwt",
     "oidc_throttled",
     "oidc_claims",
+    "oidc_subject",
 })
 
 # OIDC Core §3.1.3.7 item 10 leaves the acceptable clock skew to the client.
@@ -739,6 +740,41 @@ def fetch_userinfo(doc: dict[str, Any], access_token: str) -> dict[str, Any]:
     if not isinstance(claims, dict):
         raise OidcError("oidc_provider", "userinfo did not return a JSON object")
     return claims
+
+
+def bind_userinfo_subject(
+    userinfo: dict[str, Any], id_claims: dict[str, Any]
+) -> None:
+    """OIDC Core §5.3.2: the userinfo `sub` MUST match the ID token's.
+
+    This is not a formality here, it is the load-bearing check of the whole
+    design. Identity comes from `userinfo` (see the module docstring), and the
+    ID token is what binds the response to *this* login attempt via `nonce`.
+    Without this check the two are unrelated: a userinfo response naming a
+    different subject — or an empty one naming nobody at all — still minted a
+    session, and every group decision downstream was made about whoever the
+    userinfo endpoint felt like naming.
+
+    §5.3.2's wording is exact: "the sub Claim in the UserInfo Response MUST be
+    verified to exactly match the sub Claim in the ID Token; if they do not
+    match, the UserInfo Response values MUST NOT be used."
+    """
+    id_subject = id_claims.get("sub")
+    subject = userinfo.get("sub")
+    if not isinstance(subject, str) or not subject.strip():
+        raise OidcError(
+            "oidc_subject",
+            "the userinfo response carries no `sub` claim, so there is nothing "
+            "to tie it to the id_token this flow received. OIDC Core 5.3.2 "
+            "requires the two to match.",
+        )
+    if not isinstance(id_subject, str) or subject != id_subject:
+        raise OidcError(
+            "oidc_subject",
+            f"the userinfo `sub` ({redact(subject)}) does not match the "
+            f"id_token `sub` ({redact(id_subject)}); OIDC Core 5.3.2 says the "
+            "userinfo response must not be used",
+        )
 
 
 def subject_label(userinfo: dict[str, Any], id_claims: dict[str, Any]) -> str:
