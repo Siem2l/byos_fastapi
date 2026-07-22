@@ -114,6 +114,43 @@ body {
 		.menu a:hover, .menu a.active { background-color: var(--color-menu-active); color: var(--color-accent); }
 		.menu a .icon { margin-right: 10px; }
 		.icon { display: inline-block; width: 20px; }
+
+		/* Icons.
+		 *
+		 * The markup asks for Font Awesome (`<i class="fas fa-home">`) but no
+		 * Font Awesome stylesheet was ever loaded, so every icon in the UI
+		 * rendered as a blank 20px gap. The bundled fonts/fontawesome-webfont.ttf
+		 * is v4 and cannot help: several class names in app.js are v5/v6
+		 * (fa-sync-alt, fa-tablet-screen-button) and simply do not exist in v4.
+		 *
+		 * Rather than ship a whole icon font to draw fourteen glyphs, map each
+		 * class to a monochrome Unicode symbol. No extra request, nothing to
+		 * keep in sync with a CDN, and it inherits colour and size from the
+		 * surrounding text — which matters because the topbar and the menu use
+		 * different foreground colours. Glyphs are deliberately from the
+		 * symbol blocks, not emoji, so they stay monochrome and do not get
+		 * substituted by a colour emoji font.
+		 */
+		/* The panel is late checking in. Muted rather than alarming: waking a
+		 * few seconds after the deadline is normal ESP32 behaviour, not a fault. */
+		.refresh-overdue { color: var(--color-accent); }
+
+		.fa, .fas { display: inline-block; font-style: normal; line-height: 1; text-align: center; }
+		.fa::before, .fas::before { display: inline-block; }
+		.fa-home::before                 { content: "\2302"; }  /* ⌂ house */
+		.fa-tablet-screen-button::before { content: "\25AD"; }  /* ▭ tablet */
+		.fa-history::before              { content: "\21BA"; }  /* ↺ anticlockwise */
+		.fa-images::before               { content: "\25A4"; }  /* ▤ filled rows */
+		.fa-bars::before                 { content: "\2630"; }  /* ☰ trigram */
+		.fa-clock::before                { content: "\25F7"; }  /* ◷ circle upper right */
+		.fa-battery-half::before         { content: "\25E7"; }  /* ◧ square left half black */
+		.fa-wifi::before                 { content: "\224B"; }  /* ≋ triple tilde */
+		.fa-sync-alt::before             { content: "\21BB"; }  /* ↻ clockwise */
+		.fa-bolt::before                 { content: "\21AF"; }  /* ↯ lightning */
+		.fa-plus::before                 { content: "\FF0B"; }  /* ＋ fullwidth plus */
+		.fa-trash::before                { content: "\2715"; }  /* ✕ multiplication x */
+		.fa-moon::before                 { content: "\263E"; }  /* ☾ last quarter moon */
+		.fa-sun::before                  { content: "\263C"; }  /* ☼ white sun with rays */
 		.topbar { position: fixed; top: 0; left: 0; right: 0; height: 56px; background-color: var(--color-topbar-bg); color: var(--color-topbar-text); display: flex; align-items: center; justify-content: space-between; padding: 0 20px; box-sizing: border-box; z-index: 1000; gap: 20px; border-bottom: 1px solid var(--color-border); box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08); }
 		.topbar-left { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
 		.topbar-item { display: flex; align-items: center; }
