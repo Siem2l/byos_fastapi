@@ -169,58 +169,113 @@ def test_concurrent_cold_logins_make_exactly_one_discovery_fetch(
     )
 
 
-def test_a_login_flood_does_not_stall_the_device_plane(oidc_client, tmp_path):
-    """Finding 1, the invariant that matters: `/api/display` keeps working.
+# anyio's default threadpool is 40 workers and every route in this app is a
+# sync `def`, so a flood larger than that is what turns "slow" into "the panel
+# stopped updating". 64 is comfortably over the line.
+FLOOD_THREADS = 64
 
-    An unauthenticated flood of `/auth/oidc/login` against a stalling IdP,
-    while the panel's own endpoint is polled throughout. Every device request
-    must succeed, and none may wait anywhere near the IdP's stall time.
+
+def _device_plane_under_flood(client, label):
+    """Poll `/api/display` while `FLOOD_THREADS` threads hammer the login route.
+
+    The discovery caches are neutralised for the duration. That is not
+    stacking the deck, it is removing the thing that would otherwise be
+    measured instead of the guard: with the document cached, the second and
+    every later login does no outbound work at all and the flood costs
+    nothing. The case that has to hold is the one where the cache is not
+    helping — a cold start, an hourly TTL expiry, or (the realistic one) an
+    IdP that is down, whose failure backoff has elapsed, with every browser on
+    the network retrying at once.
     """
-    slow = SlowIdp(delay=1.0)
-    install_idp(slow)
-    oidc_routes.LOGIN_BUDGET.reset()
-
     stop = threading.Event()
-    flood_hits = [0]
-    flood_lock = threading.Lock()
+    hits = [0]
+    counter_lock = threading.Lock()
 
     def flood():
         while not stop.is_set():
             try:
-                oidc_client.get("/auth/oidc/login", follow_redirects=False)
+                client.get("/auth/oidc/login", follow_redirects=False)
             except Exception:  # pragma: no cover - the flood is best-effort
                 pass
-            with flood_lock:
-                flood_hits[0] += 1
+            with counter_lock:
+                hits[0] += 1
 
-    floods = [threading.Thread(target=flood, daemon=True) for _ in range(24)]
-    for t in floods:
-        t.start()
+    threads = [threading.Thread(target=flood, daemon=True) for _ in range(FLOOD_THREADS)]
+    for thread in threads:
+        thread.start()
     try:
+        # Let the flood fill the threadpool before the first measurement, or
+        # the numbers describe a server that is not under load yet.
+        time.sleep(0.5)
         latencies = []
         statuses = []
         for _ in range(20):
             started = time.monotonic()
-            resp = oidc_client.get(
+            response = client.get(
                 "/api/display", headers={"ID": MAC, "Access-Token": TOKEN}
             )
             latencies.append(time.monotonic() - started)
-            statuses.append(resp.status_code)
+            statuses.append(response.status_code)
     finally:
         stop.set()
-        for t in floods:
-            t.join(timeout=15)
+        for thread in threads:
+            thread.join(timeout=30)
 
-    worst = max(latencies)
     print(
-        f"device plane under a {flood_hits[0]}-request login flood: "
-        f"median {median(latencies) * 1000:.1f} ms, worst "
-        f"{worst * 1000:.1f} ms, statuses {set(statuses)}"
+        f"{label}: {hits[0]} login requests, /api/display median "
+        f"{median(latencies) * 1000:.1f} ms, worst {max(latencies) * 1000:.1f} ms, "
+        f"statuses {sorted(set(statuses))}"
     )
+    return statuses, latencies
+
+
+def test_a_login_flood_does_not_stall_the_device_plane(
+    oidc_client, tmp_path, monkeypatch
+):
+    """Finding 1, the invariant that matters: `/api/display` keeps working.
+
+    An unauthenticated flood of `/auth/oidc/login` against an IdP that stalls
+    a full second per call, while the panel's own endpoint is polled
+    throughout. Every device request must succeed, and none may wait anywhere
+    near the IdP's stall time.
+    """
+    monkeypatch.setattr(oidc_module, "DISCOVERY_TTL", 0.0)
+    monkeypatch.setattr(oidc_module, "DISCOVERY_RETRY_BACKOFF", 0.0)
+    install_idp(SlowIdp(delay=1.0))
+    oidc_routes.LOGIN_BUDGET.reset()
+    statuses, latencies = _device_plane_under_flood(oidc_client, "rate-limited flood")
     assert set(statuses) == {200}, "the panel was refused while the flood ran"
-    # The IdP stalls for a full second per call. If the flood could reach the
-    # threadpool, device latency would be a multiple of that.
-    assert worst < 1.0, f"worst device latency {worst:.3f}s under flood"
+    assert max(latencies) < 1.0, f"worst device latency {max(latencies):.3f}s"
+
+
+def test_a_distributed_login_flood_does_not_stall_the_device_plane(
+    oidc_client, tmp_path, monkeypatch
+):
+    """Finding 1, with the per-source rate limiter taken out of the picture.
+
+    A botnet does not share a source address, so the rate limiter sees one
+    request per client and lets every one of them through. What has to hold
+    then is `oidc.OUTBOUND_LIMIT`: however many callers arrive, at most eight
+    threadpool workers are ever inside an IdP call, and the other thirty-two
+    are the panel's.
+    """
+    monkeypatch.setattr(oidc_module, "DISCOVERY_TTL", 0.0)
+    monkeypatch.setattr(oidc_module, "DISCOVERY_RETRY_BACKOFF", 0.0)
+    install_idp(SlowIdp(delay=1.0))
+    budget = oidc_routes.LOGIN_BUDGET
+    original = (budget.per_source_limit, budget.global_limit)
+    budget.reset()
+    budget.per_source_limit = 10 ** 9
+    budget.global_limit = 10 ** 9
+    try:
+        statuses, latencies = _device_plane_under_flood(
+            oidc_client, "unthrottled distributed flood"
+        )
+    finally:
+        budget.per_source_limit, budget.global_limit = original
+        budget.reset()
+    assert set(statuses) == {200}, "the panel was refused while the flood ran"
+    assert max(latencies) < 1.0, f"worst device latency {max(latencies):.3f}s"
 
 
 def test_the_login_endpoint_is_rate_limited(oidc_client, idp):
