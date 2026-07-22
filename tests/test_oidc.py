@@ -1,8 +1,19 @@
-"""OIDC: configuration surface, discovery, and the code flow.
+"""OIDC: configuration, discovery, the code flow, and group authorization.
 
-Phase 1 of `docs/oidc-design.md`. Everything here runs against the
+Phases 1-3 of `docs/oidc-design.md`. Everything here runs against the
 in-process fake IdP in `conftest.py` — no network, and the flow under test is
-the real one: real `httpx` calls, real ASGI app on the other end.
+the real one: real `httpx` calls, real ASGI app on the other end, real
+browser round trip through `/auth/oidc/login` and `/auth/oidc/callback`.
+
+Two properties are asserted repeatedly rather than once, because they are the
+ones whose failure is silent in production:
+
+* an OIDC-minted session opens exactly the control plane a shared-secret one
+  does (`test_an_oidc_session_opens_the_whole_control_plane`), which is what
+  "OIDC is just another mint" means operationally; and
+* the device surface under `/api/` never sees a cookie, a session or a 302
+  no matter how OIDC is configured — the panel is an ESP32, and that failure
+  mode is a display that silently never updates.
 """
 
 from __future__ import annotations
@@ -838,3 +849,206 @@ def test_session_state_without_oidc_is_unchanged(client):
         "oidc": False,
         "oidc_provider": None,
     }
+
+
+# --- phase 3: group authorization -----------------------------------------
+
+
+def _with_groups(oidc_client, allowed):
+    cfg = panel_config()
+    cfg.oidc_allowed_groups = allowed
+    return cfg
+
+
+def test_no_restriction_admits_any_authenticated_user(oidc_client, idp):
+    """The only workable default: Google emits no group claim at all."""
+    _with_groups(oidc_client, [])
+    assert run_flow(oidc_client, idp).headers["location"] == "/auth/oidc/complete"
+    assert oidc_client.get("/rotation").status_code == 200
+
+
+def test_no_restriction_admits_a_user_with_no_group_claim(oidc_client):
+    idp = FakeIdp(groups_in_userinfo=False, groups_in_id_token=False)
+    install_idp(idp)
+    _with_groups(oidc_client, [])
+    assert run_flow(oidc_client, idp).headers["location"] == "/auth/oidc/complete"
+
+
+def test_a_matching_group_is_admitted(oidc_client, idp):
+    _with_groups(oidc_client, ["trmnl-admins"])
+    assert run_flow(oidc_client, idp).headers["location"] == "/auth/oidc/complete"
+    assert oidc_client.get("/rotation").status_code == 200
+
+
+def test_one_match_out_of_several_allowed_groups_is_enough(oidc_client):
+    idp = FakeIdp(groups=["everyone"])
+    install_idp(idp)
+    _with_groups(oidc_client, ["nobody", "everyone", "somebody"])
+    assert run_flow(oidc_client, idp).headers["location"] == "/auth/oidc/complete"
+
+
+def test_a_non_matching_group_is_refused_and_says_so(oidc_client):
+    idp = FakeIdp(groups=["guests", "everyone"])
+    install_idp(idp)
+    _with_groups(oidc_client, ["trmnl-admins"])
+    response = run_flow(oidc_client, idp)
+    # A distinct code from "no claim at all" — the difference between "your
+    # account is in the wrong group" and "your IdP is not sending groups".
+    assert response.headers["location"] == "/?login_error=oidc_group"
+    assert oidc_client.get("/rotation").status_code == 401
+
+
+def test_an_absent_claim_denies_when_a_restriction_is_set(oidc_client):
+    """Fail closed — and say which of the two failures it was."""
+    idp = FakeIdp(groups_in_userinfo=False, groups_in_id_token=False)
+    install_idp(idp)
+    _with_groups(oidc_client, ["trmnl-admins"])
+    response = run_flow(oidc_client, idp)
+    assert response.headers["location"] == "/?login_error=oidc_group_claim_missing"
+    assert oidc_client.get("/rotation").status_code == 401
+
+
+def test_an_empty_claim_denies_as_a_wrong_group_not_a_missing_one(oidc_client):
+    idp = FakeIdp(groups=[])
+    install_idp(idp)
+    _with_groups(oidc_client, ["trmnl-admins"])
+    response = run_flow(oidc_client, idp)
+    assert response.headers["location"] == "/?login_error=oidc_group"
+
+
+def test_groups_are_read_from_userinfo_first(oidc_client):
+    """Authelia's default and the path it steers clients toward."""
+    idp = FakeIdp(groups_in_userinfo=True, groups_in_id_token=False)
+    install_idp(idp)
+    _with_groups(oidc_client, ["trmnl-admins"])
+    assert run_flow(oidc_client, idp).headers["location"] == "/auth/oidc/complete"
+    assert idp.userinfo_hits == 1
+
+
+def test_groups_fall_back_to_the_id_token(oidc_client):
+    """Keycloak's `microprofile-jwt` and Authelia claims policies land here."""
+    idp = FakeIdp(groups_in_userinfo=False, groups_in_id_token=True)
+    install_idp(idp)
+    _with_groups(oidc_client, ["trmnl-admins"])
+    assert run_flow(oidc_client, idp).headers["location"] == "/auth/oidc/complete"
+
+
+def test_a_narrowed_userinfo_response_is_not_widened_by_the_id_token(
+    oidc_client,
+):
+    """First non-absent source wins; the two are never merged."""
+    idp = FakeIdp(
+        groups=["guests"],
+        groups_in_userinfo=True,
+        groups_in_id_token=True,
+        id_token_groups=["trmnl-admins"],
+    )
+    install_idp(idp)
+    _with_groups(oidc_client, ["trmnl-admins"])
+    response = run_flow(oidc_client, idp)
+    assert response.headers["location"] == "/?login_error=oidc_group"
+
+
+def test_a_custom_claim_name_is_honoured(oidc_client):
+    """authentik's `entitlements`, or any hand-rolled mapper."""
+    idp = FakeIdp(groups_claim="entitlements", groups=["trmnl-admins"])
+    install_idp(idp)
+    cfg = panel_config()
+    cfg.oidc_groups_claim = "entitlements"
+    _with_groups(oidc_client, ["trmnl-admins"])
+    assert run_flow(oidc_client, idp).headers["location"] == "/auth/oidc/complete"
+
+
+def test_a_dotted_claim_path_is_traversed(oidc_client):
+    """`resource_access.<client>.roles`, for hand-rolled Keycloak mappers."""
+    idp = FakeIdp(userinfo_claims={
+        "sub": "alice",
+        "resource_access": {"trmnl": {"roles": ["trmnl-admins"]}},
+    })
+    install_idp(idp)
+    cfg = panel_config()
+    cfg.oidc_groups_claim = "resource_access.trmnl.roles"
+    _with_groups(oidc_client, ["trmnl-admins"])
+    assert run_flow(oidc_client, idp).headers["location"] == "/auth/oidc/complete"
+
+
+def test_a_dotted_path_that_does_not_resolve_denies_as_missing(oidc_client):
+    idp = FakeIdp(userinfo_claims={"sub": "alice", "resource_access": {}})
+    install_idp(idp)
+    cfg = panel_config()
+    cfg.oidc_groups_claim = "resource_access.trmnl.roles"
+    _with_groups(oidc_client, ["trmnl-admins"])
+    response = run_flow(oidc_client, idp)
+    assert response.headers["location"] == "/?login_error=oidc_group_claim_missing"
+
+
+# --- claim resolution, unit level -----------------------------------------
+
+
+def test_a_literal_key_with_a_dot_in_it_wins_over_traversal():
+    """Flat-first: an IdP whose claim *name* contains a dot still works."""
+    claims = {
+        "a.b": ["from-the-flat-key"],
+        "a": {"b": ["from-the-path"]},
+    }
+    assert oidc.groups_from(claims, "a.b") == ["from-the-flat-key"]
+    assert oidc.groups_from({"a": {"b": ["from-the-path"]}}, "a.b") == [
+        "from-the-path"
+    ]
+
+
+def test_claim_lookup_distinguishes_absent_from_empty():
+    assert oidc.claim_lookup({}, "groups") is oidc.MISSING
+    assert oidc.claim_lookup({"groups": []}, "groups") == []
+    assert oidc.groups_from({}, "groups") is None
+    assert oidc.groups_from({"groups": []}, "groups") == []
+    assert oidc.groups_from({"groups": None}, "groups") is None
+
+
+def test_groups_from_tolerates_the_shapes_providers_actually_send():
+    # A single group as a bare string.
+    assert oidc.groups_from({"groups": "admins"}, "groups") == ["admins"]
+    # Whitespace, and non-string members in a list.
+    assert oidc.groups_from(
+        {"groups": [" admins ", 42, None, "", "users"]}, "groups"
+    ) == ["admins", "users"]
+    # Deliberately NOT split: a group name may contain a comma or a space,
+    # and splitting would invent a membership nobody granted.
+    assert oidc.groups_from({"groups": "a,b"}, "groups") == ["a,b"]
+    # A shape that cannot be a group list at all reads as absent.
+    assert oidc.groups_from({"groups": {"a": 1}}, "groups") is None
+    assert oidc.groups_from({"groups": 7}, "groups") is None
+
+
+def test_check_groups_is_case_sensitive(oidc_client):
+    """Group names are case-sensitive at every provider surveyed."""
+    cfg = panel_config()
+    cfg.oidc_allowed_groups = ["TRMNL-Admins"]
+    with pytest.raises(oidc.OidcError) as excinfo:
+        oidc.check_groups(cfg, {"groups": ["trmnl-admins"]}, {})
+    assert excinfo.value.code == "oidc_group"
+
+
+def test_the_group_denial_message_names_the_claim_and_the_fix(oidc_client):
+    cfg = panel_config()
+    cfg.oidc_allowed_groups = ["trmnl-admins"]
+    with pytest.raises(oidc.OidcError) as excinfo:
+        oidc.check_groups(cfg, {"sub": "alice"}, {"sub": "alice"})
+    assert excinfo.value.code == "oidc_group_claim_missing"
+    message = str(excinfo.value)
+    assert "'groups'" in message
+    assert "userinfo" in message
+    assert "scope" in message
+
+
+def test_a_refused_group_does_not_leave_a_session_behind(oidc_client):
+    idp = FakeIdp(groups=["guests"])
+    install_idp(idp)
+    _with_groups(oidc_client, ["trmnl-admins"])
+    response = run_flow(oidc_client, idp)
+    assert "trmnl_ui" not in response.headers.get("set-cookie", "")
+    assert oidc_client.get("/rotation").status_code == 401
+    # ...and the device surface is still untouched by any of it.
+    assert oidc_client.get(
+        "/api/display", headers={"ID": MAC, "Access-Token": TOKEN}
+    ).status_code == 200

@@ -340,6 +340,7 @@ def oidc_callback(request: Request) -> Response:
                 "sent, so the response does not belong to this login attempt",
             )
         userinfo = oidc_module.fetch_userinfo(document, tokens["access_token"])
+        groups = oidc_module.check_groups(cfg, userinfo, id_claims)
     except oidc_module.OidcError as exc:
         logger.warning("OIDC login failed (%s): %s", exc.code, exc)
         _mint_record_failure(source)
@@ -347,7 +348,9 @@ def oidc_callback(request: Request) -> Response:
 
     _mint_clear(source)
     logger.info(
-        "OIDC login accepted for %s", oidc_module.subject_label(userinfo, id_claims)
+        "OIDC login accepted for %s (groups: %s)",
+        oidc_module.subject_label(userinfo, id_claims),
+        ",".join(sorted(groups)) or "<none reported>",
     )
     response = RedirectResponse("/auth/oidc/complete", status_code=302)
     _clear_state_cookie(response)
