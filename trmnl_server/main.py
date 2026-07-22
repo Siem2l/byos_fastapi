@@ -16,7 +16,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from . import config, models
+from . import config, models, oidc
 from .config import Config
 from .routes import (
     api_router,
@@ -271,11 +271,19 @@ def create_app(cfg: Config) -> FastAPI:
     # tests/test_panel.py::test_no_cors_middleware_is_installed asserts it is
     # still absent.
 
-    if not cfg.ui_token_file:
+    # OIDC status is decided from the config *shape* only. Discovery is never
+    # fetched here: an IdP that is down at boot must not delay startup, and it
+    # certainly must not take the shared-secret login path with it.
+    level, message = oidc.startup_report(cfg)
+    getattr(logger, level)(message)
+
+    if not cfg.ui_token_file and not oidc.enabled(cfg):
         logger.error(
-            "TRMNL_UI_TOKEN_FILE is unset — the browser control plane "
-            "(/rotation, /devices, /status, /server/*) will refuse every "
-            "request with 503. Point it at a file holding the UI secret."
+            "neither TRMNL_UI_TOKEN_FILE nor a working TRMNL_OIDC_ISSUER is "
+            "configured — the browser control plane (/rotation, /devices, "
+            "/status, /server/*) will refuse every request with 503. Point "
+            "TRMNL_UI_TOKEN_FILE at a file holding the UI secret, or "
+            "configure OIDC."
         )
 
     _assert_route_invariants(app)
