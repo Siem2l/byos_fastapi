@@ -61,6 +61,12 @@ DISCOVERY_TTL = 3600.0
 # /auth/oidc/login into an outbound connection attempt.
 DISCOVERY_RETRY_BACKOFF = 15.0
 HTTP_TIMEOUT = 10.0
+# The largest reply this server will read from an identity provider. A
+# discovery document is a couple of kilobytes, a token response a few hundred
+# bytes, a userinfo response less; 256 KiB is two orders of magnitude of
+# headroom and still small enough that a hostile provider cannot use this
+# process's memory as a weapon against the panel sharing it.
+MAX_RESPONSE_BYTES = 256 * 1024
 
 # --- the device plane's share of the threadpool ----------------------------
 #
@@ -171,6 +177,74 @@ def reset_caches() -> None:
         for event in _discovery_inflight.values():
             event.set()
         _discovery_inflight.clear()
+
+
+class IdpResponse:
+    """The parts of a bounded IdP response this module is willing to look at.
+
+    Not an `httpx.Response`: the point is that the body has already been read
+    under a cap and cannot be re-read unbounded by accident.
+    """
+
+    __slots__ = ("status_code", "content_type", "content")
+
+    def __init__(self, status_code: int, content_type: str, content: bytes) -> None:
+        self.status_code = status_code
+        self.content_type = content_type
+        self.content = content
+
+    @property
+    def text(self) -> str:
+        return self.content.decode("utf-8", "replace")
+
+    def json(self) -> Any:
+        """Raises `ValueError` on a non-JSON body, like `httpx.Response.json`."""
+        return json.loads(self.content)
+
+
+def _read_capped(client: httpx.Client, request: httpx.Request, what: str) -> IdpResponse:
+    """Send `request` and read at most `MAX_RESPONSE_BYTES` of the answer.
+
+    The identity provider is a remote party this server talks to on the say-so
+    of an unauthenticated caller. Nothing bounded the reply, so a hostile or
+    broken IdP could answer `/auth/oidc/login` with a gigabyte and have this
+    process buffer all of it — one request, unbounded memory, and the panel
+    lives in the same process.
+
+    `Content-Length` is checked first (cheap, and honest providers set it) and
+    the stream is then capped anyway, because that header is a claim, not a
+    fact.
+    """
+    response = client.send(request, stream=True)
+    try:
+        declared = response.headers.get("content-length")
+        if declared is not None:
+            try:
+                if int(declared) > MAX_RESPONSE_BYTES:
+                    raise OidcError(
+                        "oidc_provider",
+                        f"the {what} response declares {int(declared)} bytes, "
+                        f"over this server's {MAX_RESPONSE_BYTES}-byte cap",
+                    )
+            except ValueError:
+                pass  # An unparseable Content-Length; the stream cap covers it.
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_bytes():
+            total += len(chunk)
+            if total > MAX_RESPONSE_BYTES:
+                raise OidcError(
+                    "oidc_provider",
+                    f"the {what} response exceeded this server's "
+                    f"{MAX_RESPONSE_BYTES}-byte cap",
+                )
+            chunks.append(chunk)
+        content_type = (
+            (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+        )
+        return IdpResponse(response.status_code, content_type, b"".join(chunks))
+    finally:
+        response.close()
 
 
 def _http_client() -> httpx.Client:
@@ -474,12 +548,21 @@ def _fetch_discovery(issuer: str) -> dict[str, Any]:
     url = issuer + DISCOVERY_PATH
     try:
         with _http_client() as client:
-            response = client.get(url, headers={"Accept": "application/json"})
-        response.raise_for_status()
+            response = _read_capped(
+                client,
+                client.build_request(
+                    "GET", url, headers={"Accept": "application/json"}
+                ),
+                "discovery",
+            )
+        if response.status_code != 200:
+            raise OidcError(
+                "oidc_provider", f"HTTP {response.status_code}"
+            )
         doc = response.json()
         problem = _discovery_problem(doc, issuer)
-    except (httpx.HTTPError, ValueError) as exc:
-        problem = f"{type(exc).__name__}: {exc}"
+    except (httpx.HTTPError, ValueError, OidcError) as exc:
+        problem = redact(f"{type(exc).__name__}: {exc}", 300)
         doc = None
 
     if problem is not None:
@@ -605,8 +688,12 @@ def exchange_code(
     headers = {"Accept": "application/json", **headers}
     try:
         with outbound_slot("token"), _http_client() as client:
-            response = client.post(
-                str(doc["token_endpoint"]), data=form, headers=headers
+            response = _read_capped(
+                client,
+                client.build_request(
+                    "POST", str(doc["token_endpoint"]), data=form, headers=headers
+                ),
+                "token",
             )
     except httpx.HTTPError as exc:
         raise OidcError(
@@ -616,7 +703,7 @@ def exchange_code(
         raise OidcError(
             "oidc_provider",
             f"token endpoint returned HTTP {response.status_code}: "
-            f"{response.text[:200]!r}",
+            f"{redact(response.text, 200)}",
         )
     try:
         payload = response.json()
@@ -771,12 +858,17 @@ def fetch_userinfo(doc: dict[str, Any], access_token: str) -> dict[str, Any]:
     """
     try:
         with outbound_slot("userinfo"), _http_client() as client:
-            response = client.get(
-                str(doc["userinfo_endpoint"]),
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Accept": "application/json",
-                },
+            response = _read_capped(
+                client,
+                client.build_request(
+                    "GET",
+                    str(doc["userinfo_endpoint"]),
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Accept": "application/json",
+                    },
+                ),
+                "userinfo",
             )
     except httpx.HTTPError as exc:
         raise OidcError(
@@ -787,8 +879,7 @@ def fetch_userinfo(doc: dict[str, Any], access_token: str) -> dict[str, Any]:
             "oidc_provider",
             f"userinfo endpoint returned HTTP {response.status_code}",
         )
-    content_type = (response.headers.get("content-type") or "").split(";")[0].strip()
-    if content_type == "application/jwt":
+    if response.content_type == "application/jwt":
         raise OidcError(
             "oidc_userinfo_jwt",
             "userinfo returned application/jwt. This server has no JWT "
