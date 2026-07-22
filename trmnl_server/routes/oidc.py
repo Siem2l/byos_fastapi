@@ -63,19 +63,36 @@ from .. import oidc as oidc_module
 from ..config import panel_config
 from ..credentials import secret_equal
 from .auth import (
+    MINT_BUDGET,
+    MINT_RATE_WINDOW,
+    RateBudget,
     _b64,
-    _mint_allowed,
-    _mint_clear,
-    _mint_record_failure,
-    _mint_source,
     _set_cookie,
     _sign,
+    client_source,
     mint_session,
 )
 
 logger = config_module.logger
 
 router = APIRouter()
+
+# --- throttling ------------------------------------------------------------
+#
+# `LOGIN_BUDGET` counts *every* `/auth/oidc/login`, not just failures, because
+# a successful login is precisely what costs the server an outbound round trip.
+# This is the first of the two bounds on that endpoint; `oidc.OUTBOUND_LIMIT`
+# is the second and is the one that holds when the flood is distributed.
+#
+# A human clicking "Sign in with ..." generates one of these. Thirty per five
+# minutes per client is a fat margin over a person retrying a failed login,
+# and three hundred globally is far more SSO logins than a panel server sees.
+LOGIN_BUDGET = RateBudget(
+    "oidc-login",
+    window=MINT_RATE_WINDOW,
+    per_source_limit=30,
+    global_limit=300,
+)
 
 STATE_COOKIE = "trmnl_oidc_state"
 # Five minutes is long enough for a password plus a TOTP prompt and short
@@ -230,6 +247,15 @@ def oidc_login(request: Request) -> Response:
     if not secret:  # pragma: no cover - implied by configuration_problem
         return _fail("oidc_disabled")
 
+    # Before any outbound work, and before any allocation: this endpoint is
+    # unauthenticated and the panel shares the threadpool it would otherwise
+    # spend. See the LOGIN_BUDGET comment.
+    source = client_source(request)
+    if not LOGIN_BUDGET.allowed(source):
+        logger.warning("/auth/oidc/login throttled for %s", source)
+        return _fail("oidc_throttled")
+    LOGIN_BUDGET.record(source)
+
     try:
         document = oidc_module.discovery(cfg)
     except oidc_module.OidcError as exc:
@@ -276,8 +302,8 @@ def oidc_callback(request: Request) -> Response:
     if not secret:  # pragma: no cover - implied by configuration_problem
         return _fail("oidc_disabled")
 
-    source = _mint_source(request)
-    if not _mint_allowed(source):
+    source = client_source(request)
+    if not MINT_BUDGET.allowed(source):
         logger.warning("OIDC callback throttled for %s", source)
         return _fail("oidc_throttled")
 
@@ -288,7 +314,7 @@ def oidc_callback(request: Request) -> Response:
             "identity provider refused the authorization request: %s",
             params.get("error"),
         )
-        _mint_record_failure(source)
+        MINT_BUDGET.record(source)
         return _fail("oidc_provider")
 
     cookie = request.cookies.get(STATE_COOKIE) or ""
@@ -299,11 +325,11 @@ def oidc_callback(request: Request) -> Response:
             "OIDC callback refused: state cookie missing, expired, forged or "
             "not matching the state parameter"
         )
-        _mint_record_failure(source)
+        MINT_BUDGET.record(source)
         return _fail("oidc_state")
     if not _claim_state(payload["state"]):
         logger.warning("OIDC callback refused: state was already redeemed")
-        _mint_record_failure(source)
+        MINT_BUDGET.record(source)
         return _fail("oidc_state")
 
     # RFC 9207. Optional, and only a few providers send it, but when it is
@@ -317,12 +343,12 @@ def oidc_callback(request: Request) -> Response:
             "OIDC callback refused: the `iss` parameter does not match the "
             "configured issuer"
         )
-        _mint_record_failure(source)
+        MINT_BUDGET.record(source)
         return _fail("oidc_state")
 
     code = params.get("code") or ""
     if not code:
-        _mint_record_failure(source)
+        MINT_BUDGET.record(source)
         return _fail("oidc_state")
 
     try:
@@ -351,10 +377,10 @@ def oidc_callback(request: Request) -> Response:
         groups = oidc_module.check_groups(cfg, userinfo, id_claims)
     except oidc_module.OidcError as exc:
         logger.warning("OIDC login failed (%s): %s", exc.code, exc)
-        _mint_record_failure(source)
+        MINT_BUDGET.record(source)
         return _fail(exc.code)
 
-    _mint_clear(source)
+    MINT_BUDGET.clear(source)
     logger.info(
         "OIDC login accepted for %s (groups: %s)",
         oidc_module.subject_label(userinfo, id_claims),

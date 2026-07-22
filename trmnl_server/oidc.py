@@ -37,6 +37,8 @@ import hashlib
 import json
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
 
@@ -59,12 +61,41 @@ DISCOVERY_TTL = 3600.0
 DISCOVERY_RETRY_BACKOFF = 15.0
 HTTP_TIMEOUT = 10.0
 
+# --- the device plane's share of the threadpool ----------------------------
+#
+# Every route in this app is a sync `def`, so FastAPI runs each one in anyio's
+# threadpool — which defaults to 40 workers and is *shared* with `/api/display`,
+# `/api/setup` and `/api/log`. A blocking outbound call therefore does not stall
+# the event loop, but it does hold a worker for up to `HTTP_TIMEOUT` seconds.
+#
+# `/auth/oidc/login` is unauthenticated and does outbound work, so without a
+# bound an unauthenticated flood parks every worker on a slow IdP and the panel
+# — which cannot retry, cannot follow a redirect and has no way to report the
+# failure — simply stops updating. That is a control-plane endpoint taking the
+# device plane down with it, which is the one thing this fork's route split
+# exists to prevent.
+#
+# So: at most OUTBOUND_LIMIT threadpool workers may ever be inside an IdP call
+# (or waiting on one), leaving 40 - OUTBOUND_LIMIT for everything else. Over
+# the limit the login is refused immediately with `oidc_throttled` rather than
+# queued, because queueing is exactly the resource the attacker is after.
+OUTBOUND_LIMIT = 8
+# How long a follower waits for the in-flight discovery fetch it is sharing.
+# Bounded by the same timeout the fetch itself has, plus a little slack.
+OUTBOUND_WAIT = HTTP_TIMEOUT + 1.0
+
+_outbound_slots = threading.BoundedSemaphore(OUTBOUND_LIMIT)
+
 # Test seam. Production leaves this None and httpx builds its own transport;
 # tests set an in-process transport so the entire flow runs with no network.
 HTTP_TRANSPORT: httpx.BaseTransport | None = None
 
 _discovery_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _discovery_failures: dict[str, tuple[float, str]] = {}
+# Single-flight: one in-flight discovery fetch per issuer, whatever the arrival
+# rate. Without it N concurrent cold logins are N outbound requests, which both
+# hammers the IdP and multiplies the number of workers parked on it.
+_discovery_inflight: dict[str, threading.Event] = {}
 _discovery_lock = threading.Lock()
 
 # The fixed vocabulary the callback is allowed to put in `?login_error=`.
@@ -110,6 +141,9 @@ def reset_caches() -> None:
     with _discovery_lock:
         _discovery_cache.clear()
         _discovery_failures.clear()
+        for event in _discovery_inflight.values():
+            event.set()
+        _discovery_inflight.clear()
 
 
 def _http_client() -> httpx.Client:
@@ -121,6 +155,27 @@ def _http_client() -> httpx.Client:
         follow_redirects=False,
         transport=HTTP_TRANSPORT,
     )
+
+
+@contextmanager
+def outbound_slot(what: str) -> Iterator[None]:
+    """Hold one of the OUTBOUND_LIMIT permits, or refuse the login outright.
+
+    Non-blocking on purpose. See the OUTBOUND_LIMIT comment: an unauthenticated
+    caller must never be able to make a threadpool worker wait, because the
+    worker is the thing `/api/display` also needs.
+    """
+    if not _outbound_slots.acquire(blocking=False):
+        raise OidcError(
+            "oidc_throttled",
+            f"refusing to start an outbound {what} call: all {OUTBOUND_LIMIT} "
+            "OIDC slots are busy. The device plane shares this server's "
+            "threadpool and keeps its share.",
+        )
+    try:
+        yield
+    finally:
+        _outbound_slots.release()
 
 
 # --- configuration ---------------------------------------------------------
@@ -268,6 +323,49 @@ def discovery(cfg: Config) -> dict[str, Any]:
     `POST /auth/session` or `require_ui_session` calls into this module.
     """
     issuer = normalise_issuer(cfg.oidc_issuer)
+    cached = _cached_discovery(issuer)
+    if cached is not None:
+        return cached
+
+    # Nothing cached, so this call may have to go out. Take a slot *before*
+    # deciding whether to lead or follow, so the number of workers tied up in
+    # discovery — fetching or waiting — is bounded by OUTBOUND_LIMIT either way.
+    with outbound_slot("discovery"):
+        while True:
+            cached = _cached_discovery(issuer)
+            if cached is not None:
+                return cached
+            with _discovery_lock:
+                inflight = _discovery_inflight.get(issuer)
+                if inflight is None:
+                    inflight = threading.Event()
+                    _discovery_inflight[issuer] = inflight
+                    leader = True
+                else:
+                    leader = False
+            if leader:
+                try:
+                    return _fetch_discovery(issuer)
+                finally:
+                    with _discovery_lock:
+                        _discovery_inflight.pop(issuer, None)
+                    inflight.set()
+            # Follower: the leader's result — document or cached failure —
+            # lands in the cache, so wait for it rather than making a second
+            # identical request. Bounded by the fetch's own timeout.
+            if not inflight.wait(OUTBOUND_WAIT):
+                raise OidcError(
+                    "oidc_provider",
+                    "timed out waiting for an in-flight discovery fetch to "
+                    f"{issuer + DISCOVERY_PATH}",
+                )
+            # Loop: re-read the cache the leader just populated. If the leader
+            # raced with a `reset_caches()` there is nothing there, and this
+            # thread becomes the next leader rather than spinning.
+
+
+def _cached_discovery(issuer: str) -> dict[str, Any] | None:
+    """The cached document, or None. Raises when a *failure* is still cached."""
     now = time.monotonic()
     with _discovery_lock:
         cached = _discovery_cache.get(issuer)
@@ -276,7 +374,12 @@ def discovery(cfg: Config) -> dict[str, Any]:
         failed = _discovery_failures.get(issuer)
         if failed and failed[0] > now:
             raise OidcError("oidc_provider", failed[1])
+    return None
 
+
+def _fetch_discovery(issuer: str) -> dict[str, Any]:
+    """One actual outbound discovery request. Callers hold an outbound slot."""
+    now = time.monotonic()
     url = issuer + DISCOVERY_PATH
     try:
         with _http_client() as client:
@@ -410,7 +513,7 @@ def exchange_code(
     }
     headers = {"Accept": "application/json", **headers}
     try:
-        with _http_client() as client:
+        with outbound_slot("token"), _http_client() as client:
             response = client.post(
                 str(doc["token_endpoint"]), data=form, headers=headers
             )
@@ -470,7 +573,7 @@ def fetch_userinfo(doc: dict[str, Any], access_token: str) -> dict[str, Any]:
     leave the signing algorithm at `none`.
     """
     try:
-        with _http_client() as client:
+        with outbound_slot("userinfo"), _http_client() as client:
             response = client.get(
                 str(doc["userinfo_endpoint"]),
                 headers={

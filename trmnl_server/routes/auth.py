@@ -69,25 +69,117 @@ _KEY_CONTEXT = b"trmnl-ui-session-v1"
 # Methods that cannot change state, and so do not need the origin check.
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
-# --- POST /auth/session throttling ----------------------------------------
+# --- throttling for unauthenticated routes ---------------------------------
 #
-# This route is an unauthenticated oracle for the UI secret. It is nominally
-# behind Authentik, but the premise of this whole module is that the app
-# cannot tell an SSO'd request from a bypassed one, so it is bounded as
+# `POST /auth/session` is an unauthenticated oracle for the UI secret. It is
+# nominally behind Authentik, but the premise of this whole module is that the
+# app cannot tell an SSO'd request from a bypassed one, so it is bounded as
 # though it were exposed. Only *failures* are counted, and a success clears
 # the caller's counter: an operator who fat-fingers the secret once and then
 # gets it right is never locked out by their own successful login, while a
 # guesser gets ten tries per five minutes and no more.
-_MINT_RATE_WINDOW = 300.0        # seconds
-_MINT_FAIL_LIMIT = 10            # failed attempts per window per client
-_MINT_GLOBAL_FAIL_LIMIT = 100    # failed attempts per window, all clients
-_MINT_MAX_SOURCES = 512          # distinct clients tracked, to bound the dict
-_mint_failures: dict[str, list[float]] = {}
-_mint_global_failures: list[float] = []
-_mint_lock = threading.Lock()
+#
+# The counter is a class rather than a set of module globals because there is
+# now more than one unauthenticated route that needs one, and they must NOT
+# share a budget. A cross-site flood of `/auth/oidc/callback` costs the
+# operator nothing if the OIDC path has its own accounting, and locks every
+# operator out of the shared-secret form if it does not.
 
 
-def _mint_source(request: Request) -> str:
+class RateBudget:
+    """A sliding-window per-source *and* global counter.
+
+    Two counters, not one: behind a tunnelling edge every request arrives from
+    the same address, so a per-source limit alone is a limit of one bucket,
+    and a global limit alone lets one noisy client spend everyone's budget.
+
+    `source` is a client address, which an attacker on a shared egress can
+    forge only by moving hosts — this is a cost multiplier, not an identity.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        window: float,
+        per_source_limit: int,
+        global_limit: int,
+        max_sources: int = 512,
+    ) -> None:
+        self.name = name
+        self.window = window
+        self.per_source_limit = per_source_limit
+        self.global_limit = global_limit
+        self.max_sources = max_sources
+        self._per_source: dict[str, list[float]] = {}
+        self._global: list[float] = []
+        self._lock = threading.Lock()
+
+    def allowed(self, source: str) -> bool:
+        """False once this client, or the server as a whole, is over budget."""
+        now = time.monotonic()
+        cutoff = now - self.window
+        with self._lock:
+            hits = [t for t in self._per_source.get(source, []) if t >= cutoff]
+            if hits:
+                self._per_source[source] = hits
+            else:
+                self._per_source.pop(source, None)
+            if len(hits) >= self.per_source_limit:
+                return False
+            self._global = [t for t in self._global if t >= cutoff]
+            return len(self._global) < self.global_limit
+
+    def record(self, source: str) -> None:
+        now = time.monotonic()
+        cutoff = now - self.window
+        with self._lock:
+            if len(self._per_source) > self.max_sources:
+                for key in [
+                    k for k, v in self._per_source.items()
+                    if not v or v[-1] < cutoff
+                ]:
+                    del self._per_source[key]
+                if len(self._per_source) > self.max_sources:
+                    self._per_source.clear()
+            hits = [t for t in self._per_source.get(source, []) if t >= cutoff]
+            hits.append(now)
+            self._per_source[source] = hits
+            self._global = [t for t in self._global if t >= cutoff]
+            self._global.append(now)
+
+    def clear(self, source: str) -> None:
+        """A correct secret proves the caller is not the guesser being throttled."""
+        with self._lock:
+            self._per_source.pop(source, None)
+
+    def reset(self) -> None:
+        """Drop every counter. For the test suite, which builds ~30 apps."""
+        with self._lock:
+            self._per_source.clear()
+            self._global.clear()
+
+    def tracked(self, source: str) -> int:
+        """How many hits are currently attributed to `source`. Diagnostics only."""
+        now = time.monotonic()
+        cutoff = now - self.window
+        with self._lock:
+            return len([t for t in self._per_source.get(source, []) if t >= cutoff])
+
+
+MINT_RATE_WINDOW = 300.0        # seconds
+MINT_FAIL_LIMIT = 10            # failed attempts per window per client
+MINT_GLOBAL_FAIL_LIMIT = 100    # failed attempts per window, all clients
+
+MINT_BUDGET = RateBudget(
+    "session-mint",
+    window=MINT_RATE_WINDOW,
+    per_source_limit=MINT_FAIL_LIMIT,
+    global_limit=MINT_GLOBAL_FAIL_LIMIT,
+)
+
+
+def client_source(request: Request) -> str:
     """Client address, or a single shared bucket when there is none.
 
     Behind Pangolin every request arrives from the Newt tunnel, so in
@@ -96,48 +188,6 @@ def _mint_source(request: Request) -> str:
     """
     client = request.client
     return client.host if client and client.host else "unknown"
-
-
-def _mint_allowed(source: str) -> bool:
-    """False once this client, or the server as a whole, is over its budget."""
-    now = time.monotonic()
-    cutoff = now - _MINT_RATE_WINDOW
-    with _mint_lock:
-        hits = [t for t in _mint_failures.get(source, []) if t >= cutoff]
-        if hits:
-            _mint_failures[source] = hits
-        else:
-            _mint_failures.pop(source, None)
-        if len(hits) >= _MINT_FAIL_LIMIT:
-            return False
-        global _mint_global_failures
-        _mint_global_failures = [t for t in _mint_global_failures if t >= cutoff]
-        return len(_mint_global_failures) < _MINT_GLOBAL_FAIL_LIMIT
-
-
-def _mint_record_failure(source: str) -> None:
-    now = time.monotonic()
-    cutoff = now - _MINT_RATE_WINDOW
-    with _mint_lock:
-        if len(_mint_failures) > _MINT_MAX_SOURCES:
-            for key in [
-                k for k, v in _mint_failures.items() if not v or v[-1] < cutoff
-            ]:
-                del _mint_failures[key]
-            if len(_mint_failures) > _MINT_MAX_SOURCES:
-                _mint_failures.clear()
-        hits = [t for t in _mint_failures.get(source, []) if t >= cutoff]
-        hits.append(now)
-        _mint_failures[source] = hits
-        global _mint_global_failures
-        _mint_global_failures = [t for t in _mint_global_failures if t >= cutoff]
-        _mint_global_failures.append(now)
-
-
-def _mint_clear(source: str) -> None:
-    """A correct secret proves the caller is not the guesser being throttled."""
-    with _mint_lock:
-        _mint_failures.pop(source, None)
 
 
 def _b64(raw: bytes) -> str:
@@ -296,8 +346,8 @@ def create_session(
     secret = panel_config().ui_token()
     if not secret:
         return Response(status_code=503)
-    source = _mint_source(request)
-    if not _mint_allowed(source):
+    source = client_source(request)
+    if not MINT_BUDGET.allowed(source):
         logger.warning("session mint throttled for %s", source)
         return Response(status_code=429)
     supplied = request.headers.get("X-TRMNL-UI-Token") or ""
@@ -309,9 +359,9 @@ def create_session(
     # wrong one take the same path — and a non-ASCII one is a 401, not the
     # 500 `hmac.compare_digest` would raise on it.
     if not secret_equal(supplied.strip(), secret):
-        _mint_record_failure(source)
+        MINT_BUDGET.record(source)
         return Response(status_code=401)
-    _mint_clear(source)
+    MINT_BUDGET.clear(source)
     response = Response(status_code=204)
     _set_cookie(response, mint_session(secret))
     return response

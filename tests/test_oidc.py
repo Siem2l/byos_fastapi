@@ -702,34 +702,24 @@ def test_a_discovery_outage_leaves_the_secret_form_working(oidc_client):
 def test_the_callback_is_throttled_like_the_secret_mint(oidc_client, idp):
     from trmnl_server.routes import auth as auth_module
 
-    auth_module._mint_failures.clear()
-    auth_module._mint_global_failures.clear()
+    limit = auth_module.MINT_FAIL_LIMIT
     codes = []
-    for _ in range(auth_module._MINT_FAIL_LIMIT + 3):
+    for _ in range(limit + 3):
         response = oidc_client.get(
             "/auth/oidc/callback?code=x&state=guess", follow_redirects=False
         )
         codes.append(response.headers["location"])
-    assert codes[: auth_module._MINT_FAIL_LIMIT] == [
-        "/?login_error=oidc_state"
-    ] * auth_module._MINT_FAIL_LIMIT
-    assert set(codes[auth_module._MINT_FAIL_LIMIT:]) == {
-        "/?login_error=oidc_throttled"
-    }
-    auth_module._mint_failures.clear()
-    auth_module._mint_global_failures.clear()
+    assert codes[:limit] == ["/?login_error=oidc_state"] * limit
+    assert set(codes[limit:]) == {"/?login_error=oidc_throttled"}
 
 
 def test_a_successful_oidc_login_clears_the_failure_counter(oidc_client, idp):
     from trmnl_server.routes import auth as auth_module
 
-    auth_module._mint_failures.clear()
-    auth_module._mint_global_failures.clear()
-    for _ in range(auth_module._MINT_FAIL_LIMIT - 1):
+    for _ in range(auth_module.MINT_FAIL_LIMIT - 1):
         oidc_client.get("/auth/oidc/callback?code=x&state=y", follow_redirects=False)
     assert run_flow(oidc_client, idp).headers["location"] == "/auth/oidc/complete"
-    assert not auth_module._mint_failures
-    auth_module._mint_global_failures.clear()
+    assert auth_module.MINT_BUDGET.tracked("testclient") == 0
 
 
 # --- provider variation ---------------------------------------------------
