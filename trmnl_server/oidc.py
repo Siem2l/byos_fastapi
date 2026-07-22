@@ -18,7 +18,7 @@ validation slots in behind an optional extra later without changing the flow.
 **What this module deliberately does not do**: talk to the database, hold a
 session, or know anything about cookies. It hands `routes/oidc.py` a
 validated set of claims; that module ends the flow in the *existing*
-`auth.mint_session()`.
+`auth.issue_session()`.
 
 **The HTTP seam.** Everything outbound goes through `_http_client()`, and it
 honours the module-level `HTTP_TRANSPORT`. That is the one hook the test

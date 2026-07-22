@@ -396,6 +396,103 @@ def test_the_session_cookie_stays_strict(oidc_client, idp):
     assert "secure" in header
 
 
+# --- an OIDC session must not outlive the authorization behind it ----------
+
+
+def _session_cookie(response) -> str:
+    """The raw `trmnl_ui` Set-Cookie header from a callback response."""
+    return next(
+        h for h in response.headers.get_list("set-cookie")
+        if h.startswith("trmnl_ui=")
+    )
+
+
+def test_an_oidc_session_is_much_shorter_lived_than_a_shared_secret_one(
+    oidc_client, idp
+):
+    """The IdP can revoke; this server would never hear about it.
+
+    Remove someone from `TRMNL_OIDC_ALLOWED_GROUPS`' group and, at 30 days,
+    their dashboard kept working for a month. The lifetime of an OIDC session
+    is exactly the window in which a revoked operator still has access, so it
+    is the IdP's session that should be doing the work, not ours.
+    """
+    from trmnl_server.routes import auth as auth_module
+
+    cfg = panel_config()
+    assert cfg.oidc_session_lifetime() == 8 * 3600
+    assert cfg.oidc_session_lifetime() < auth_module.SESSION_TTL
+
+    header = _session_cookie(run_flow(oidc_client, idp))
+    assert f"Max-Age={cfg.oidc_session_lifetime()}" in header
+    assert f"Max-Age={auth_module.SESSION_TTL}" not in header
+
+
+def test_the_oidc_cookie_max_age_matches_its_signed_expiry(oidc_client, idp):
+    """A short payload in a long cookie is a dashboard that 401s in place.
+
+    `auth.issue_session()` takes one `ttl` and uses it for both. This is the
+    test that says so, in the direction that actually broke: the two used to be
+    the same constant read twice, and only one of them was parameterised.
+    """
+    cfg = panel_config()
+    value = _session_cookie(run_flow(oidc_client, idp)).split(";")[0]
+    signed_exp = int(value.split("=", 1)[1].split(".")[1])
+    assert abs(signed_exp - (time.time() + cfg.oidc_session_lifetime())) <= 5
+
+
+def test_the_oidc_session_lifetime_is_configurable(oidc_client, idp):
+    cfg = panel_config()
+    cfg.oidc_session_ttl = 900
+    try:
+        header = _session_cookie(run_flow(oidc_client, idp))
+        assert "Max-Age=900" in header
+        signed_exp = int(header.split(";")[0].split("=", 1)[1].split(".")[1])
+        assert abs(signed_exp - (time.time() + 900)) <= 5
+    finally:
+        cfg.oidc_session_ttl = 8 * 3600
+
+
+@pytest.mark.parametrize("bad", [0, -1, "eight hours", None])
+def test_an_unusable_session_ttl_falls_back_to_the_default(oidc_client, bad):
+    """Zero would mint a cookie that has already expired — a silent no-login."""
+    cfg = panel_config()
+    cfg.oidc_session_ttl = bad
+    try:
+        assert cfg.oidc_session_lifetime() == 8 * 3600
+    finally:
+        cfg.oidc_session_ttl = 8 * 3600
+
+
+def test_an_oidc_session_actually_expires_on_that_schedule(
+    oidc_client, idp, monkeypatch
+):
+    """Not just an attribute on a header — the server stops honouring it."""
+    from trmnl_server.routes import auth as auth_module
+
+    cfg = panel_config()
+    cfg.oidc_session_ttl = 60
+    try:
+        assert run_flow(oidc_client, idp).status_code == 302
+        assert oidc_client.get("/status").status_code == 200
+        # The cookie jar has no clock of its own here, so move the *server's*:
+        # this is the check `require_ui_session` makes on every request.
+        later = time.time() + 61
+        monkeypatch.setattr(auth_module.time, "time", lambda: later)
+        assert oidc_client.get("/status").status_code == 401
+    finally:
+        cfg.oidc_session_ttl = 8 * 3600
+
+
+def test_the_env_var_follows_the_trmnl_convention(monkeypatch):
+    from trmnl_server.config import Config
+
+    monkeypatch.setenv("TRMNL_OIDC_SESSION_TTL", "43200")
+    assert Config().oidc_session_lifetime() == 43200
+    monkeypatch.setenv("TRMNL_OIDC_SESSION_TTL", "not-a-number")
+    assert Config().oidc_session_lifetime() == 8 * 3600
+
+
 def test_the_happy_path_mints_the_ordinary_session(oidc_client, idp):
     response = run_flow(oidc_client, idp)
     assert response.status_code == 302

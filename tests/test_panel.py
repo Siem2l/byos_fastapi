@@ -24,6 +24,7 @@ from __future__ import annotations
 # pylint: disable=import-outside-toplevel,missing-function-docstring
 
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -278,6 +279,30 @@ def test_session_cookie_attributes(client):
     assert "httponly" in cookie
     assert "samesite=strict" in cookie
     assert "secure" in cookie  # base_url is https:// in the fixture
+
+
+def test_a_shared_secret_session_still_lasts_thirty_days(client):
+    """OIDC sessions were shortened; this one was deliberately not.
+
+    Possession of `TRMNL_UI_TOKEN_FILE` *is* the authorization here — there is
+    no third party who can withdraw it behind this server's back, and the only
+    revocation there has ever been (rotate the file) takes effect on the next
+    request regardless of how long the cookie says it lives. So the 30 days
+    stay, and the two paths having different lifetimes is the point rather
+    than an oversight.
+    """
+    from trmnl_server.routes import auth as auth_module
+
+    resp = client.post("/auth/session", json={"token": UI_TOKEN})
+    assert resp.status_code == 204
+    header = resp.headers["set-cookie"]
+    assert auth_module.SESSION_TTL == 30 * 24 * 3600
+    assert f"Max-Age={auth_module.SESSION_TTL}" in header
+    # ...and the *signed* expiry agrees with the cookie's, or one of the two is
+    # a lie. See `auth.issue_session`.
+    value = header.split(";")[0].split("=", 1)[1]
+    signed_exp = int(value.split(".")[1])
+    assert abs(signed_exp - (time.time() + auth_module.SESSION_TTL)) <= 5
 
 
 def test_session_can_be_cleared(ui_client):

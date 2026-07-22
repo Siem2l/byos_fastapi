@@ -2,15 +2,24 @@
 
 Two routes plus an interstitial. Nothing here invents a session format, a
 cookie or a gate: `/auth/oidc/callback` finishes by calling
-`auth.mint_session()` and `auth._set_cookie()`, the same two functions
-`POST /auth/session` calls, so the cookie an SSO login produces is
-byte-indistinguishable from a shared-secret one and everything downstream —
-`require_ui_session`, the origin pin, the TTL, rotation-invalidates-sessions
-— is unchanged by construction.
+`auth.issue_session()`, the same function `POST /auth/session` calls, so the
+cookie an SSO login produces is the same shape as a shared-secret one and
+everything downstream — `require_ui_session`, the origin pin,
+rotation-invalidates-sessions — is unchanged by construction.
 
     shared-secret login ─┐
-                         ├─→ mint_session() → trmnl_ui cookie → require_ui_session()
+                         ├─→ issue_session() → trmnl_ui cookie → require_ui_session()
     OIDC code flow ──────┘
+
+The one deliberate difference is *lifetime*. A shared-secret session lasts
+`auth.SESSION_TTL` (30 days); an OIDC one lasts
+`Config.oidc_session_lifetime()` (8 hours by default,
+`TRMNL_OIDC_SESSION_TTL`), because it is a cached claim about an authorization
+the identity provider granted and can withdraw — a group membership removed, an
+account disabled — without this server ever being told. The shared secret has
+no such external authority to fall out of step with. Nothing downstream reads
+the difference: it is one number, carried identically in the signature and the
+cookie's max-age.
 
 **This router is not under `/api/`, and must never be.** The panel is an
 ESP32 that follows no redirects and cannot do SSO; the edge bypasses SSO for
@@ -67,10 +76,9 @@ from .auth import (
     MINT_RATE_WINDOW,
     RateBudget,
     _b64,
-    _set_cookie,
     _sign,
     client_source,
-    mint_session,
+    issue_session,
 )
 
 logger = config_module.logger
@@ -511,9 +519,13 @@ def oidc_callback(request: Request) -> Response:
     )
     response = RedirectResponse("/auth/oidc/complete", status_code=302)
     _clear_state_cookie(response)
-    # The single join point. Same function, same cookie, same everything as
-    # the shared-secret path — see the module docstring.
-    _set_cookie(response, mint_session(secret))
+    # The single join point. Same function, same cookie, same signing key, same
+    # gate — see the module docstring. The one thing that differs is how long it
+    # lasts: `oidc_session_lifetime()` rather than `auth.SESSION_TTL`, because
+    # this session is a cached claim about an authorization the IdP can withdraw
+    # without telling us. `issue_session` puts that number in both the signature
+    # and the cookie's max-age, so the two cannot disagree.
+    issue_session(response, secret, ttl=cfg.oidc_session_lifetime())
     return response
 
 

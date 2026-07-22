@@ -59,9 +59,17 @@ logger = config_module.logger
 router = APIRouter()
 
 COOKIE_NAME = "trmnl_ui"
-# 30 days. The cookie is HttpOnly and SameSite=Strict, and the key rotates
-# with the secret file, so a long life costs little and spares the operator
-# a login every time they open the dashboard.
+# 30 days, for a session minted from the shared secret. The cookie is HttpOnly
+# and SameSite=Strict, and the key rotates with the secret file, so a long life
+# costs little and spares the operator a login every time they open the
+# dashboard. Crucially there is no external authority for such a session to
+# diverge from: possession of `TRMNL_UI_TOKEN_FILE` *is* the authorization, and
+# the only revocation there has ever been is rotating that file — which
+# invalidates the session on its next request whatever this number says.
+#
+# An OIDC session is a different claim and gets a different, much shorter
+# lifetime (`Config.oidc_session_lifetime()`), because there the IdP can
+# withdraw the authorization at any time and this server would never hear.
 SESSION_TTL = 30 * 24 * 3600
 _VERSION = "v1"
 _KEY_CONTEXT = b"trmnl-ui-session-v1"
@@ -316,11 +324,11 @@ def require_ui_session(request: Request) -> None:
         raise HTTPException(status_code=403, detail="cross-origin request refused")
 
 
-def _set_cookie(response: Response, value: str) -> None:
+def _set_cookie(response: Response, value: str, *, ttl: int) -> None:
     response.set_cookie(
         COOKIE_NAME,
         value,
-        max_age=SESSION_TTL,
+        max_age=ttl,
         httponly=True,
         # Strict, not Lax: nothing links into a control-plane URL, `/` needs
         # no cookie to render, and the SPA's own XHRs are same-site.
@@ -331,6 +339,26 @@ def _set_cookie(response: Response, value: str) -> None:
         secure=(panel_config().base_url or "").startswith("https://"),
         path="/",
     )
+
+
+def issue_session(response: Response, secret: str, *, ttl: int = SESSION_TTL) -> None:
+    """Mint a session and attach its cookie, with **one** lifetime for both.
+
+    The only way either login path is allowed to hand out a session, and the
+    reason it exists is that there are now two lifetimes. The signed payload's
+    `exp` and the cookie's `max_age` used to be the same constant read twice,
+    which is fine right up until they are not the same constant — and then the
+    mismatch is silent in both directions:
+
+    * a short payload inside a long cookie is a dashboard that looks logged in
+      and 401s on every request, with no login form offered, until the operator
+      knows to clear a cookie by hand;
+    * a long payload inside a short cookie is a session the browser throws away
+      while the server would still have honoured it.
+
+    Taking one `ttl` and using it twice makes both unrepresentable.
+    """
+    _set_cookie(response, mint_session(secret, ttl=ttl), ttl=ttl)
 
 
 @router.post("/auth/session")
@@ -363,7 +391,9 @@ def create_session(
         return Response(status_code=401)
     MINT_BUDGET.clear(source)
     response = Response(status_code=204)
-    _set_cookie(response, mint_session(secret))
+    # No `ttl=`: the shared-secret path keeps SESSION_TTL, the 30 days it has
+    # always had. Only the OIDC path overrides it.
+    issue_session(response, secret)
     return response
 
 
