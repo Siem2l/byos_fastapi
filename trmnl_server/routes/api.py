@@ -10,25 +10,26 @@ collision, so leaving those here would have made the include order in
 internet. They are deleted rather than reordered.
 
 Everything that remains is browser-facing and lives *outside* the `/api/`
-namespace, which is load-bearing: the Pangolin edge config bypasses SSO for
-`/api/*` and `/image/*` precisely because the ESP32 cannot follow an SSO
-redirect. Do not move a browser endpoint under `/api/` — it would silently
-lose its Authentik gate. That is no longer a convention held up by this
+namespace, which is load-bearing: any reverse proxy in front of this server
+has to bypass authentication for `/api/*` and `/image/*` precisely because
+the ESP32 cannot follow an SSO redirect. Do not move a browser endpoint under
+`/api/` — it would silently lose that outer gate. That is no longer a
+convention held up by this
 comment: `main.py::_assert_route_invariants()` refuses to build the app if
 any route outside the firmware's fixed device surface appears under `/api/`.
 
 Authorisation is attached to the *router*, not to individual routes — see
-`routes/auth.py` for why the edge's SSO cannot be relied on alone (it
-forwards no identity, and the backend cannot distinguish an SSO'd request
-from a bypassed one). Every route below therefore requires an app-owned
+`routes/auth.py` for why an edge's SSO cannot be relied on alone (it
+typically forwards no identity, and the backend cannot distinguish an SSO'd
+request from a bypassed one). Every route below therefore requires an app-owned
 session cookie, and every mutating one additionally requires a same-origin
 request. Routes added to this router inherit both automatically; nobody has
 to remember a decorator. None of these is a "safe read": `/server/log` and
 `/status` both carry frame-preview capabilities.
 
 `/settings`, `/settings/refreshtime` and `/settings/imagepath` are also gone:
-this fork is env-var driven (the NixOS module owns every knob) and never
-calls `config.apply_persisted_config()`, so those writes would have
+this fork is env-var driven (the deployment's unit or compose file owns
+every knob) and never calls `config.apply_persisted_config()`, so those writes would have
 persisted rows that nothing reads back.
 """
 

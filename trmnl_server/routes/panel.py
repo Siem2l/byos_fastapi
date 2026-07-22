@@ -170,8 +170,8 @@ class Renderer:
         """What to draw, newest source of truth first.
 
         The UI's rotation wins when it resolves to at least one screen;
-        otherwise TRMNL_PLAYLIST, which is what the NixOS module sets and
-        what a fresh deployment has before any plugin has run.
+        otherwise TRMNL_PLAYLIST, which is what the deployment sets and what
+        a fresh install has before any plugin has run.
         """
         try:
             slugs = _rotation_slugs(device_id)
