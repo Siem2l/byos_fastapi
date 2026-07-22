@@ -18,6 +18,19 @@ ones whose failure is silent in production:
 
 from __future__ import annotations
 
+# pytest's conventions collide with five pylint defaults, none of which is
+# reporting a defect here:
+#   unused-argument / redefined-outer-name — a fixture is requested by naming
+#     it as a parameter, and a test that only needs the fixture's side effect
+#     (an app built, OIDC configured) never references the name.
+#   protected-access / import-outside-toplevel — these are white-box tests of
+#     module-global state, and several modules must be imported *after* the
+#     app is built to observe what building it did.
+#   missing-function-docstring — the test names are the documentation; the
+#     ones with something extra to say have a docstring already.
+# pylint: disable=unused-argument,redefined-outer-name,protected-access
+# pylint: disable=import-outside-toplevel,missing-function-docstring
+
 import base64
 import json
 import os

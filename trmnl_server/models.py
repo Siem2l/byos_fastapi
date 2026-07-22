@@ -255,6 +255,7 @@ def _trim_log_class(db: Session, *, protected: bool, cap: int, slack: int) -> No
     """Evict oldest-first within one retention class, never across classes."""
     where = _protected_filter(protected)
     total = db.execute(
+        # pylint: disable-next=not-callable  # sqlalchemy builds func.count at runtime
         select(func.count()).select_from(LogEntry).where(where)
     ).scalar_one()
     if total <= cap + slack:

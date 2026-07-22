@@ -10,6 +10,19 @@ The `client` / `ui_client` fixtures and the constants below live in
 
 from __future__ import annotations
 
+# pytest's conventions collide with five pylint defaults, none of which is
+# reporting a defect here:
+#   unused-argument / redefined-outer-name — a fixture is requested by naming
+#     it as a parameter, and a test that only needs the fixture's side effect
+#     (an app built, OIDC configured) never references the name.
+#   protected-access / import-outside-toplevel — these are white-box tests of
+#     module-global state, and several modules must be imported *after* the
+#     app is built to observe what building it did.
+#   missing-function-docstring — the test names are the documentation; the
+#     ones with something extra to say have a docstring already.
+# pylint: disable=unused-argument,redefined-outer-name,protected-access
+# pylint: disable=import-outside-toplevel,missing-function-docstring
+
 import os
 from pathlib import Path
 
@@ -139,6 +152,7 @@ def test_log_table_is_row_capped(client, monkeypatch):
         from sqlalchemy import func, select as sa_select
 
         total = db.execute(
+            # pylint: disable-next=not-callable  # see models.py
             sa_select(func.count()).select_from(models.LogEntry)
         ).scalar_one()
     assert total <= 40 + 10
@@ -792,6 +806,7 @@ def test_protected_log_rows_are_themselves_capped(client, monkeypatch):
         from sqlalchemy import func, select as sa_select
 
         total = db.execute(
+            # pylint: disable-next=not-callable  # see models.py
             sa_select(func.count())
             .select_from(models.LogEntry)
             .where(models.LogEntry.context == "/api/setup")
