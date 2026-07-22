@@ -362,9 +362,13 @@ def oidc_callback(request: Request) -> Response:
     params = request.query_params
     if params.get("error"):
         # The provider refused. Log what it said; show the operator a code.
+        # `error` is a query parameter: whoever sent the browser here chose
+        # it, IdP or not. Unbounded and unescaped it was a log-injection and
+        # log-flooding primitive on an endpoint anyone can hit.
         logger.warning(
-            "identity provider refused the authorization request: %s",
-            params.get("error"),
+            "identity provider refused the authorization request: %s (%s)",
+            oidc_module.redact(params.get("error")),
+            oidc_module.redact(params.get("error_description"), 200),
         )
         CALLBACK_BUDGET.record(source)
         return _fail("oidc_provider")
@@ -442,8 +446,10 @@ def oidc_callback(request: Request) -> Response:
     CALLBACK_BUDGET.clear(source)
     logger.info(
         "OIDC login accepted for %s (groups: %s)",
+        # Both are provider-chosen strings; see oidc.redact().
         oidc_module.subject_label(userinfo, id_claims),
-        ",".join(sorted(groups)) or "<none reported>",
+        oidc_module.redact(",".join(sorted(groups)), 200)
+        if groups else "<none reported>",
     )
     response = RedirectResponse("/auth/oidc/complete", status_code=302)
     _clear_state_cookie(response)

@@ -685,3 +685,94 @@ def test_a_state_is_still_single_use_end_to_end(oidc_client, idp):
     assert first.headers["location"] == "/auth/oidc/complete"
     second = oidc_client.get(f"{split.path}?{split.query}", follow_redirects=False)
     assert second.headers["location"] == "/?login_error=oidc_state"
+
+
+# --- 9: nothing the provider says reaches the log unbounded or unescaped ---
+
+
+def test_redact_escapes_control_characters_and_truncates():
+    """Finding 9. A log file an unauthenticated caller can write lines into."""
+    injected = "alice\nJan 01 00:00:00 trmnl: ERROR forged line"
+    rendered = oidc_module.redact(injected)
+    assert "\n" not in rendered, "a newline survived into the log line"
+    assert "\r" not in rendered
+    assert "\\n" in rendered
+
+    huge = "x" * 10_000
+    rendered = oidc_module.redact(huge)
+    assert len(rendered) < 300
+    assert "+9880 more" in rendered
+
+
+def test_the_callback_error_parameter_is_bounded_and_escaped(
+    oidc_client, caplog
+):
+    """`?error=` is chosen by whoever sent the browser here, IdP or not."""
+    import logging
+
+    payload = "denied\n" + "A" * 20_000
+    with caplog.at_level(logging.WARNING):
+        oidc_client.get(
+            "/auth/oidc/callback",
+            params={"error": payload, "error_description": "B" * 20_000},
+            follow_redirects=False,
+        )
+    records = [r for r in caplog.records if "refused the authorization" in r.message]
+    assert records, "the refusal was not logged at all"
+    rendered = records[0].getMessage()
+    assert len(rendered) < 1000, f"{len(rendered)} characters of provider text"
+    assert "\n" not in rendered
+
+
+def test_a_hostile_subject_label_is_bounded_and_escaped(oidc_client, idp, caplog):
+    """Finding 9. The success line quotes a name the provider chose."""
+    import logging
+
+    idp.userinfo_claims = {
+        "sub": "alice",
+        "preferred_username": "alice\nforged: " + "Z" * 5_000,
+        "groups": ["trmnl-admins"],
+    }
+    with caplog.at_level(logging.INFO):
+        assert run_flow(oidc_client, idp).headers[
+            "location"
+        ] == "/auth/oidc/complete"
+    records = [r for r in caplog.records if "OIDC login accepted" in r.message]
+    assert records
+    rendered = records[0].getMessage()
+    assert "\n" not in rendered
+    assert len(rendered) < 400
+
+
+def test_a_hostile_group_list_is_bounded(oidc_client, idp, caplog):
+    """A provider can send a thousand groups; the log line must not grow with it."""
+    import logging
+
+    idp.groups = [f"group-{i}" for i in range(2000)]
+    with caplog.at_level(logging.INFO):
+        run_flow(oidc_client, idp)
+    records = [r for r in caplog.records if "OIDC login accepted" in r.message]
+    assert records
+    assert len(records[0].getMessage()) < 600
+
+
+def test_no_credential_ever_reaches_the_log(oidc_client, idp, caplog):
+    """Finding 9's other half: tokens, codes and secrets are not logged at all."""
+    import logging
+
+    from conftest import OIDC_CLIENT_SECRET
+
+    with caplog.at_level(logging.DEBUG):
+        login = oidc_client.get("/auth/oidc/login", follow_redirects=False)
+        callback = idp.authorize(login.headers["location"])
+        split = urlsplit(callback)
+        oidc_client.get(f"{split.path}?{split.query}", follow_redirects=False)
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert OIDC_CLIENT_SECRET not in logged
+    for code in idp._codes:
+        assert code not in logged
+    for access_token in idp._access_tokens:
+        assert access_token not in logged
+    # The state and PKCE verifier are credentials for this flow too.
+    assert "code_verifier" not in logged

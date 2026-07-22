@@ -497,11 +497,11 @@ def _discovery_problem(doc: object, issuer: str) -> str | None:
         # these two legitimately differ, and rejecting it would break a
         # provider this feature exists to support.
         logger.warning(
-            "OIDC discovery at %s advertises issuer %r, which differs from "
+            "OIDC discovery at %s advertises issuer %s, which differs from "
             "the configured TRMNL_OIDC_ISSUER %r. Continuing — authentik in "
             "global issuer mode does exactly this — but check the value if "
             "logins fail.",
-            issuer + DISCOVERY_PATH, advertised, issuer,
+            issuer + DISCOVERY_PATH, redact(advertised), issuer,
         )
     return None
 
@@ -677,8 +677,9 @@ def _token_auth(
             raise OidcError(
                 "oidc_provider",
                 "the provider supports none of the client authentication "
-                f"methods this server implements (advertised: {methods!r}; "
-                "supported: client_secret_basic, client_secret_post)",
+                f"methods this server implements (advertised: "
+                f"{redact(methods, 200)}; supported: client_secret_basic, "
+                "client_secret_post)",
             )
     else:
         chosen = "client_secret_basic"
@@ -758,7 +759,8 @@ def decode_jwt_claims(token: str) -> dict[str, Any]:
         claims = json.loads(b64url_decode(parts[1]))
     except (ValueError, binascii.Error) as exc:
         raise OidcError(
-            "oidc_provider", f"id_token payload is not decodable JSON: {exc}"
+            "oidc_provider",
+            f"id_token payload is not decodable JSON: {redact(str(exc))}",
         ) from exc
     if not isinstance(claims, dict):
         raise OidcError("oidc_provider", "id_token payload is not a JSON object")
@@ -959,13 +961,23 @@ def bind_userinfo_subject(
         )
 
 
+# A username, an email address or an opaque `sub`. Long enough for any real
+# one, short enough that a provider cannot use the log as a write primitive.
+SUBJECT_LABEL_LIMIT = 96
+
+
 def subject_label(userinfo: dict[str, Any], id_claims: dict[str, Any]) -> str:
-    """A short human handle for the log line. Never a credential."""
+    """A short human handle for the log line. Never a credential.
+
+    Redacted, because every candidate claim is a string the identity provider
+    chose: unbounded and free to contain a newline, which in a log file is a
+    forged second line.
+    """
     for source in (userinfo, id_claims):
         for key in ("preferred_username", "email", "name", "sub"):
             value = source.get(key)
             if isinstance(value, str) and value.strip():
-                return value.strip()
+                return redact(value.strip(), SUBJECT_LABEL_LIMIT)
     return "<unknown>"
 
 
@@ -1050,7 +1062,7 @@ def check_groups(
         raise OidcError(
             "oidc_group",
             f"none of the account's {claim!r} values from {source} "
-            f"({sorted(groups)!r}) is in TRMNL_OIDC_ALLOWED_GROUPS "
+            f"({redact(sorted(groups), 200)}) is in TRMNL_OIDC_ALLOWED_GROUPS "
             f"({sorted(allowed)!r})",
         )
     return groups
