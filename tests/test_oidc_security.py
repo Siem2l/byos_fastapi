@@ -558,3 +558,79 @@ def test_the_body_cap_holds_whatever_content_length_claims(declare_length):
 def test_a_normal_sized_body_is_unaffected(oidc_client, idp):
     """The cap has two orders of magnitude of headroom over a real provider."""
     assert run_flow(oidc_client, idp).headers["location"] == "/auth/oidc/complete"
+
+
+# --- 7: PKCE support is negotiated, never assumed --------------------------
+
+
+class NoPkceIdp(FakeIdp):
+    """A provider that issues the code without checking the challenge.
+
+    Exactly what an IdP with PKCE switched off does, and — this is the finding
+    — completely indistinguishable from a compliant one at the callback, since
+    a successful login looks the same either way.
+    """
+
+    def authorize(self, authorization_url: str, *, sub: str = "alice") -> str:
+        from urllib.parse import parse_qs
+
+        params = {
+            k: v[0]
+            for k, v in parse_qs(urlsplit(authorization_url).query).items()
+        }
+        code = "code-nopkce"
+        self._codes[code] = {
+            "challenge": None,
+            "nonce": params.get("nonce"),
+            "redirect_uri": params.get("redirect_uri"),
+            "sub": sub,
+        }
+        return f"{params['redirect_uri']}?code={code}&state={params.get('state', '')}"
+
+
+@pytest.mark.parametrize(
+    "methods,why",
+    [
+        (["plain"], "the original PoC D: plain only, S256 never offered"),
+        ([], "an empty list"),
+        (None, "the key absent altogether"),
+        (["S512"], "a method this server does not implement"),
+    ],
+)
+def test_a_provider_that_cannot_prove_pkce_is_refused(
+    client, tmp_path, methods, why
+):
+    """Finding 7, inverted PoC D. The downgrade is silent, so negotiate."""
+    configure_oidc(tmp_path)
+    document = {
+        "issuer": OIDC_ISSUER,
+        "authorization_endpoint": f"{OIDC_ISSUER}/authorize",
+        "token_endpoint": f"{OIDC_ISSUER}/token",
+        "userinfo_endpoint": f"{OIDC_ISSUER}/userinfo",
+    }
+    if methods is not None:
+        document["code_challenge_methods_supported"] = methods
+    install_idp(NoPkceIdp(discovery_document=document))
+    login = client.get("/auth/oidc/login", follow_redirects=False)
+    assert login.headers["location"] == "/?login_error=oidc_provider", why
+
+
+def test_s256_is_selected_even_when_plain_is_also_offered(client, tmp_path):
+    """authentik advertises both. `plain` puts the verifier in the request."""
+    from urllib.parse import parse_qs
+
+    configure_oidc(tmp_path)
+    both = FakeIdp(discovery_document={
+        "issuer": OIDC_ISSUER,
+        "authorization_endpoint": f"{OIDC_ISSUER}/authorize",
+        "token_endpoint": f"{OIDC_ISSUER}/token",
+        "userinfo_endpoint": f"{OIDC_ISSUER}/userinfo",
+        "code_challenge_methods_supported": ["plain", "S256"],
+    })
+    install_idp(both)
+    login = client.get("/auth/oidc/login", follow_redirects=False)
+    params = parse_qs(urlsplit(login.headers["location"]).query)
+    assert params["code_challenge_method"] == ["S256"]
+    # And the verifier itself is nowhere in the authorization request.
+    assert "code_verifier" not in params
+    assert run_flow(client, both).headers["location"] == "/auth/oidc/complete"

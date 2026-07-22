@@ -119,8 +119,13 @@ def test_an_advertised_issuer_mismatch_is_a_warning_not_a_failure(
         {"issuer": OIDC_ISSUER, "authorization_endpoint": "/relative",
          "token_endpoint": f"{OIDC_ISSUER}/t",
          "userinfo_endpoint": f"{OIDC_ISSUER}/u"},
+        # Endpoints fine, but nothing says the provider does PKCE at all.
+        {"issuer": OIDC_ISSUER,
+         "authorization_endpoint": f"{OIDC_ISSUER}/a",
+         "token_endpoint": f"{OIDC_ISSUER}/t",
+         "userinfo_endpoint": f"{OIDC_ISSUER}/u"},
     ],
-    ids=["no-endpoints", "no-userinfo", "relative-endpoint"],
+    ids=["no-endpoints", "no-userinfo", "relative-endpoint", "no-pkce-metadata"],
 )
 def test_an_unusable_discovery_document_is_refused(oidc_client, document):
     install_idp(FakeIdp(discovery_document=document))
@@ -759,6 +764,7 @@ def test_an_authorization_endpoint_with_a_query_string_is_appended_to(
         "authorization_endpoint": f"{OIDC_ISSUER}/authorize?tenant=home",
         "token_endpoint": f"{OIDC_ISSUER}/token",
         "userinfo_endpoint": f"{OIDC_ISSUER}/userinfo",
+        "code_challenge_methods_supported": ["S256"],
     }
     install_idp(FakeIdp(discovery_document=document))
     url = begin_login(oidc_client)
