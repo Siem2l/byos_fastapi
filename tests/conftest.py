@@ -172,6 +172,7 @@ class FakeIdp:
         userinfo_claims: dict[str, Any] | None = None,
         nonce_override: str | None = None,
         omit_id_token: bool = False,
+        id_token_groups: list[str] | None = None,
     ) -> None:
         self.issuer = issuer
         self.advertised_issuer = advertised_issuer
@@ -186,6 +187,7 @@ class FakeIdp:
         self.userinfo_claims = userinfo_claims
         self.nonce_override = nonce_override
         self.omit_id_token = omit_id_token
+        self.id_token_groups = id_token_groups
         self.client_secret = OIDC_CLIENT_SECRET
 
         # Observability for assertions.
@@ -347,7 +349,10 @@ class FakeIdp:
 
             claims = idp._claims(record["sub"], nonce=record["nonce"])
             if idp.groups_in_id_token:
-                claims[idp.groups_claim] = list(idp.groups)
+                claims[idp.groups_claim] = list(
+                    idp.groups if idp.id_token_groups is None
+                    else idp.id_token_groups
+                )
             access_token = "at-" + secrets.token_hex(8)
             idp._access_tokens[access_token] = {"sub": record["sub"]}
             body: dict[str, Any] = {

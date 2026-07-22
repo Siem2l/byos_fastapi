@@ -516,3 +516,90 @@ def subject_label(userinfo: dict[str, Any], id_claims: dict[str, Any]) -> str:
             if isinstance(value, str) and value.strip():
                 return value.strip()
     return "<unknown>"
+
+
+# --- authorization ---------------------------------------------------------
+
+
+def claim_lookup(claims: dict[str, Any], path: str) -> Any:
+    """Resolve `path` in `claims`, flat key first, dotted path second.
+
+    Flat-first matters: an IdP that legitimately emits a claim whose *name*
+    contains a dot must not be broken by dotted-path support. Only if the
+    literal key is absent is the value split and traversed, which is what
+    makes `resource_access.trmnl.roles` reachable for hand-rolled mappers.
+
+    Returns `MISSING` when the claim is not present at all — distinct from a
+    present-but-empty list, and the difference the error surface depends on.
+    """
+    if path in claims:
+        return claims[path]
+    if "." not in path:
+        return MISSING
+    node: Any = claims
+    for part in path.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return MISSING
+        node = node[part]
+    return node
+
+
+def groups_from(claims: dict[str, Any], path: str) -> list[str] | None:
+    """The group names at `path`, or None when the claim is absent/unusable."""
+    value = claim_lookup(claims, path)
+    if value is MISSING or value is None:
+        return None
+    if isinstance(value, str):
+        # A few providers emit a single group as a bare string. Deliberately
+        # not split on commas or spaces: group names may contain both, and a
+        # split would invent memberships nobody granted.
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, (list, tuple)):
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+    return None
+
+
+def check_groups(
+    cfg: Config, userinfo: dict[str, Any], id_claims: dict[str, Any]
+) -> list[str]:
+    """Enforce `TRMNL_OIDC_ALLOWED_GROUPS`. Returns the groups that were seen.
+
+    Reads userinfo first and falls back to the ID token. Userinfo is the
+    authoritative, freshest source and the one Authelia explicitly steers
+    clients toward; the ID token covers Keycloak's `microprofile-jwt` and
+    Authelia claims policies, which land groups there and nowhere else. First
+    *non-absent* source wins and they are never merged — a deliberately
+    narrowed userinfo response must not be widened by a staler ID token.
+
+    Fails closed when a restriction is configured: an absent claim denies.
+    When no restriction is configured an absent claim is fine, because
+    otherwise Google — which has no group or role claim of any kind — could
+    never be used at all.
+    """
+    claim = cfg.oidc_groups_claim
+    groups = groups_from(userinfo, claim)
+    source = "userinfo"
+    if groups is None:
+        groups = groups_from(id_claims, claim)
+        source = "id_token"
+    allowed = [g for g in cfg.oidc_allowed_groups if g]
+    if not allowed:
+        return groups or []
+    if groups is None:
+        raise OidcError(
+            "oidc_group_claim_missing",
+            f"the identity provider returned no {claim!r} claim in either the "
+            "userinfo response or the ID token, and TRMNL_OIDC_ALLOWED_GROUPS "
+            "is set. Check that the scope granting group membership is "
+            "requested and that the claim is included in the userinfo "
+            "response.",
+        )
+    matched = sorted(set(groups) & set(allowed))
+    if not matched:
+        raise OidcError(
+            "oidc_group",
+            f"none of the account's {claim!r} values from {source} "
+            f"({sorted(groups)!r}) is in TRMNL_OIDC_ALLOWED_GROUPS "
+            f"({sorted(allowed)!r})",
+        )
+    return groups
