@@ -413,3 +413,89 @@ def test_a_matching_userinfo_subject_still_logs_in(oidc_client, idp):
         "location"
     ] == "/auth/oidc/complete"
     assert oidc_client.get("/status").status_code == 200
+
+
+# --- 5: no plaintext transport, because the design rests on TLS ------------
+
+
+@pytest.mark.parametrize(
+    "issuer",
+    [
+        "http://idp.lan",
+        "http://idp.example",
+        "http://192.168.1.10:9000",
+        "http://[2001:db8::1]/idp",
+    ],
+)
+def test_a_plaintext_issuer_disables_oidc(client, tmp_path, issuer):
+    """Finding 5, inverted PoC C.
+
+    Not a nice-to-have. The zero-dependency design skips the ID token
+    signature under OIDC Core 3.1.3.7 item 6, which permits it only because
+    the token arrives "over a TLS-protected channel". Over http there is no
+    such channel, so the exemption does not apply and the whole argument for
+    not carrying a JWT library collapses.
+    """
+    cfg = configure_oidc(tmp_path, oidc_issuer=issuer)
+    problem = oidc_module.configuration_problem(cfg)
+    print("configuration_problem ->", problem)
+    assert problem is not None
+    assert "3.1.3.7" in problem
+    assert oidc_module.enabled(cfg) is False
+
+
+@pytest.mark.parametrize(
+    "issuer",
+    [
+        "http://127.0.0.1:9000",
+        "http://127.0.0.2:9000",
+        "http://localhost:9000",
+        "http://[::1]:9000",
+        "http://idp.localhost:9000",
+    ],
+)
+def test_loopback_http_is_still_permitted(client, tmp_path, issuer):
+    """...and local development keeps working, which is why loopback is carved out."""
+    cfg = configure_oidc(
+        tmp_path, oidc_issuer=issuer, base_url="http://127.0.0.1:8105"
+    )
+    try:
+        assert oidc_module.configuration_problem(cfg) is None
+        assert oidc_module.enabled(cfg) is True
+    finally:
+        cfg.base_url = "https://trmnl.example"
+
+
+def test_a_plaintext_redirect_uri_disables_oidc(client, tmp_path):
+    """The authorization code comes back on it. It is not a lesser hop."""
+    cfg = configure_oidc(tmp_path, base_url="http://trmnl.example")
+    try:
+        problem = oidc_module.configuration_problem(cfg)
+        assert problem is not None and "redirect URI" in problem
+    finally:
+        cfg.base_url = "https://trmnl.example"
+
+
+def test_discovery_may_not_move_an_endpoint_to_plaintext(client, tmp_path):
+    """Finding 5, inverted PoC C2.
+
+    A correct https issuer is not enough if the document it serves can then
+    move the token endpoint — where the client_secret goes and the ID token
+    comes back — onto a cleartext hop.
+    """
+    configure_oidc(tmp_path)
+    for endpoint in (
+        "authorization_endpoint", "token_endpoint", "userinfo_endpoint"
+    ):
+        document = {
+            "issuer": OIDC_ISSUER,
+            "authorization_endpoint": f"{OIDC_ISSUER}/authorize",
+            "token_endpoint": f"{OIDC_ISSUER}/token",
+            "userinfo_endpoint": f"{OIDC_ISSUER}/userinfo",
+            "code_challenge_methods_supported": ["S256"],
+        }
+        document[endpoint] = "http://evil.example/x"
+        install_idp(FakeIdp(discovery_document=document))
+        login = client.get("/auth/oidc/login", follow_redirects=False)
+        assert login.status_code == 302
+        assert login.headers["location"] == "/?login_error=oidc_provider", endpoint
