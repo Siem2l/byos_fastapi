@@ -499,3 +499,62 @@ def test_discovery_may_not_move_an_endpoint_to_plaintext(client, tmp_path):
         login = client.get("/auth/oidc/login", follow_redirects=False)
         assert login.status_code == 302
         assert login.headers["location"] == "/?login_error=oidc_provider", endpoint
+
+
+# --- 6: IdP response bodies are bounded ------------------------------------
+
+
+def test_an_oversized_discovery_document_is_refused(client, tmp_path):
+    """Finding 6. The IdP is a remote party an unauthenticated caller invokes."""
+    configure_oidc(tmp_path)
+    install_idp(FakeIdp(discovery_document={
+        "issuer": OIDC_ISSUER,
+        "authorization_endpoint": f"{OIDC_ISSUER}/authorize",
+        "token_endpoint": f"{OIDC_ISSUER}/token",
+        "userinfo_endpoint": f"{OIDC_ISSUER}/userinfo",
+        "code_challenge_methods_supported": ["S256"],
+        "padding": "x" * (oidc_module.MAX_RESPONSE_BYTES + 1),
+    }))
+    login = client.get("/auth/oidc/login", follow_redirects=False)
+    assert login.headers["location"] == "/?login_error=oidc_provider"
+
+
+def test_an_oversized_userinfo_response_is_refused(oidc_client, idp):
+    """Finding 6, on the one endpoint whose body is attacker-influenced."""
+    idp.userinfo_claims = {
+        "sub": "alice",
+        "groups": ["trmnl-admins"],
+        "padding": "x" * (oidc_module.MAX_RESPONSE_BYTES + 1),
+    }
+    response = run_flow(oidc_client, idp)
+    assert response.headers["location"] == "/?login_error=oidc_provider"
+    assert oidc_client.get("/status").status_code == 401
+
+
+@pytest.mark.parametrize("declare_length", [True, False])
+def test_the_body_cap_holds_whatever_content_length_claims(declare_length):
+    """Finding 6. `Content-Length` is a claim, not a fact, so the stream is capped too."""
+    import httpx
+
+    oversized = b"y" * (oidc_module.MAX_RESPONSE_BYTES + 4096)
+
+    def handler(request):
+        headers = {"content-type": "application/json"}
+        if not declare_length:
+            # Chunked: no Content-Length for the early check to catch.
+            return httpx.Response(
+                200, headers=headers, content=iter([oversized])
+            )
+        return httpx.Response(200, headers=headers, content=oversized)
+
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport) as http:
+        request = http.build_request("GET", "https://idp.example/userinfo")
+        with pytest.raises(oidc_module.OidcError) as excinfo:
+            oidc_module._read_capped(http, request, "userinfo")
+    assert "cap" in str(excinfo.value)
+
+
+def test_a_normal_sized_body_is_unaffected(oidc_client, idp):
+    """The cap has two orders of magnitude of headroom over a real provider."""
+    assert run_flow(oidc_client, idp).headers["location"] == "/auth/oidc/complete"
