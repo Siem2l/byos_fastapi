@@ -235,7 +235,15 @@ def create_app(cfg: Config) -> FastAPI:
         # Render once up front so the UI has rotation entries (and the
         # Playlists tab has something to show) on the very first page load
         # rather than after the first refresh interval elapses.
-        await plugins.refresh_plugin_assets()
+        #
+        # Held open across the whole refresh: the plugins render concurrently
+        # and append one at a time, so pruning or auto-filling against the
+        # half-filled rotation would corrupt the saved playlist.
+        with state.rotation_population():
+            await plugins.refresh_plugin_assets()
+        # Only now do entry IDs exist, so only now can TRMNL_PLAYLIST be
+        # resolved to them. No-ops unless the DB has no rotation at all.
+        state.seed_default_playlist_from_config(list(cfg.playlist))
         await plugins.start_plugin_refreshers()
         try:
             yield

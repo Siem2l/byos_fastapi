@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from hashlib import sha1
 from os.path import abspath
 from time import time
 from io import BytesIO
 from threading import RLock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from fastapi import Request
 
@@ -23,6 +24,11 @@ start_time = time()
 _IMAGE_TOKEN_TTL_SECONDS = 600.0
 
 _server_base_url = ''
+
+# Depth counter rather than a bool so nesting can never clear the guard early.
+# Only the per-plugin refreshers run concurrently with it, and those append
+# against a complete `meta`, where pruning is correct and wanted.
+_rotation_populating = 0
 
 
 class RotationUnavailableError(RuntimeError):
@@ -282,7 +288,45 @@ def _selected_matches_all(master: Dict[str, Any]) -> bool:
     return all(lhs == rhs for lhs, rhs in zip(selected_ids, ids))
 
 
+@contextmanager
+def rotation_population() -> Iterator[None]:
+    """Suppress selection pruning and auto-fill while the rotation is filling.
+
+    `refresh_plugin_assets` renders every plugin concurrently and appends them
+    one at a time, so `meta` is incomplete for the whole of that window. A
+    selection pruned against a partial `meta` loses every entry whose plugin
+    simply has not finished rendering yet — at startup that emptied the saved
+    playlist outright, and the empty list was written straight back to the DB.
+    From then on `_selected_ids_for_device` fell through to "every entry",
+    which is why the panel rotated screens the deployed config excluded.
+
+    Guarding only the first append is not enough: with `gather` the second and
+    later appends still see a partial `meta`, which turns a deterministic wipe
+    into an order-dependent one. So the whole population window is suppressed,
+    read path included — a device can poll while startup is still running.
+
+    Nothing is lost by waiting: `build_rotation_snapshot` prunes on read, once
+    `meta` is complete and pruning actually means something.
+    """
+    global _rotation_populating
+    with STATE_LOCK:
+        _rotation_populating += 1
+    try:
+        yield
+    finally:
+        with STATE_LOCK:
+            _rotation_populating -= 1
+
+
+def rotation_is_populating() -> bool:
+    """True while a rotation population window is open. Call under STATE_LOCK."""
+    return _rotation_populating > 0
+
+
 def _prune_missing_selected_ids(master: Dict[str, Any]) -> bool:
+    # Every caller already holds STATE_LOCK, so this read is consistent.
+    if rotation_is_populating():
+        return False
     selected_ids = master.get('selected_ids') or []
     if not selected_ids:
         return False
@@ -412,6 +456,60 @@ def initialize_rotation_playlists_from_storage() -> None:
 
     for device_id, playlist_name in models.list_device_playlist_bindings():
         cache_device_playlist_binding(device_id, playlist_name)
+
+
+def seed_default_playlist_from_config(slugs: List[str]) -> bool:
+    """Seed the default rotation from TRMNL_PLAYLIST on a first boot only.
+
+    The ownership rule is "config seeds, the UI owns". A stored row — even one
+    the operator edited down to a single screen — is the user's, so this is a
+    no-op whenever one exists. It fires only when there is genuinely nothing
+    saved: a fresh install, or a wiped state directory.
+
+    Must be called AFTER the population window closes. Entry IDs are derived
+    from the generated asset URLs, so they do not exist until the plugins have
+    rendered at least once.
+
+    Returns True when a seed was written.
+    """
+    if not slugs:
+        return False
+    if models.get_rotation_playlist() is not None:
+        logger.info("rotation already stored; not seeding from TRMNL_PLAYLIST")
+        return False
+
+    # Imported here rather than at module scope: building the plugin registry
+    # instantiates every plugin class, which reaches into the panel config, and
+    # state.py is imported long before `set_panel_config()` has run.
+    from ..plugins.garmin import SLUG_BY_PLUGIN
+
+    plugin_by_slug = {slug: plugin for plugin, slug in SLUG_BY_PLUGIN.items()}
+    with STATE_LOCK:
+        master = rotation_master()
+        entry_by_plugin = {
+            entry.get('plugin'): entry.get('id')
+            for entry in master.get('meta') or []
+            if entry.get('id')
+        }
+        selected: List[str] = []
+        for slug in slugs:
+            entry_id = entry_by_plugin.get(plugin_by_slug.get(slug))
+            if entry_id:
+                selected.append(entry_id)
+            else:
+                # Not fatal: the screen may have failed to render this cycle.
+                # Whatever resolves still seeds, and panel.py falls back to the
+                # full TRMNL_PLAYLIST if nothing does.
+                logger.warning("cannot seed rotation with %r: no rendered entry", slug)
+        if not selected:
+            logger.warning("no configured screens resolved; leaving rotation unseeded")
+            return False
+        master['selected_ids'] = selected
+        master['has_persistent_playlist'] = True
+
+    persist_default_playlist(selected)
+    logger.info("seeded default rotation from TRMNL_PLAYLIST: %s", ', '.join(slugs))
+    return True
 
 
 def _replace_selected_hash(master: Dict[str, Any], previous_hash: Optional[str], new_hash: str) -> None:
@@ -987,8 +1085,16 @@ def append_rotation_assets(
             )
             master['version'] += 1
             # Only auto-fill if there's no existing playlist AND no persistent playlist was loaded
-            # This prevents overwriting user-defined playlists during plugin refresh
-            if not master.get('selected_ids') and not master.get('has_persistent_playlist'):
+            # This prevents overwriting user-defined playlists during plugin refresh.
+            # Suppressed mid-population as well: `meta_list` is partial there, so
+            # this would persist "every screen that happened to render first" and
+            # then look like a real saved playlist to the next boot. On a first
+            # boot the seed from TRMNL_PLAYLIST runs once population completes.
+            if (
+                not rotation_is_populating()
+                and not master.get('selected_ids')
+                and not master.get('has_persistent_playlist')
+            ):
                 master['selected_ids'] = [entry.get('id') for entry in meta_list if entry.get('id')]
                 selection_snapshot = list(master['selected_ids'])
 
