@@ -63,7 +63,6 @@ from .. import oidc as oidc_module
 from ..config import panel_config
 from ..credentials import secret_equal
 from .auth import (
-    MINT_BUDGET,
     MINT_RATE_WINDOW,
     RateBudget,
     _b64,
@@ -79,11 +78,26 @@ router = APIRouter()
 
 # --- throttling ------------------------------------------------------------
 #
+# Two budgets, and neither is the shared-secret form's.
+#
+# `CALLBACK_BUDGET` counts failed callbacks. It used to be `auth`'s mint
+# counter, which meant a hundred cross-site GETs on `/auth/oidc/callback` —
+# free to send, requiring no credential and no cookie — spent the *global*
+# mint budget and locked every operator out of `POST /auth/session`. An
+# attacker who cannot guess the secret could still deny it to everyone. The
+# two paths are different oracles over different secrets, so they get
+# different accounting; a failure on one must never cost the other.
+#
 # `LOGIN_BUDGET` counts *every* `/auth/oidc/login`, not just failures, because
 # a successful login is precisely what costs the server an outbound round trip.
 # This is the first of the two bounds on that endpoint; `oidc.OUTBOUND_LIMIT`
 # is the second and is the one that holds when the flood is distributed.
-#
+CALLBACK_BUDGET = RateBudget(
+    "oidc-callback",
+    window=MINT_RATE_WINDOW,
+    per_source_limit=10,
+    global_limit=100,
+)
 # A human clicking "Sign in with ..." generates one of these. Thirty per five
 # minutes per client is a fat margin over a person retrying a failed login,
 # and three hundred globally is far more SSO logins than a panel server sees.
@@ -289,11 +303,14 @@ def oidc_login(request: Request) -> Response:
 def oidc_callback(request: Request) -> Response:
     """Finish the flow and mint the ordinary session cookie.
 
-    Throttled with the same counters as `POST /auth/session`
-    (`auth._mint_*`): both are unauthenticated endpoints that answer
-    differently depending on whether a supplied value was right, which is the
-    same oracle class, and behind a tunnelling edge every caller shares one
-    source address — hence the global counter as well as the per-source one.
+    Throttled on `CALLBACK_BUDGET`, which is shaped like `POST /auth/session`'s
+    but is emphatically *not* the same counter. Both are unauthenticated
+    endpoints that answer differently depending on whether a supplied value was
+    right, so both need a budget; behind a tunnelling edge every caller shares
+    one source address, so both need a global counter as well as a per-source
+    one. But they are oracles over *different* secrets, and sharing one budget
+    meant a hundred cross-site GETs here — free to send, no credential, no
+    cookie — locked every operator out of the shared-secret form.
     """
     cfg = panel_config()
     if oidc_module.configuration_problem(cfg):
@@ -303,7 +320,7 @@ def oidc_callback(request: Request) -> Response:
         return _fail("oidc_disabled")
 
     source = client_source(request)
-    if not MINT_BUDGET.allowed(source):
+    if not CALLBACK_BUDGET.allowed(source):
         logger.warning("OIDC callback throttled for %s", source)
         return _fail("oidc_throttled")
 
@@ -314,7 +331,7 @@ def oidc_callback(request: Request) -> Response:
             "identity provider refused the authorization request: %s",
             params.get("error"),
         )
-        MINT_BUDGET.record(source)
+        CALLBACK_BUDGET.record(source)
         return _fail("oidc_provider")
 
     cookie = request.cookies.get(STATE_COOKIE) or ""
@@ -325,11 +342,11 @@ def oidc_callback(request: Request) -> Response:
             "OIDC callback refused: state cookie missing, expired, forged or "
             "not matching the state parameter"
         )
-        MINT_BUDGET.record(source)
+        CALLBACK_BUDGET.record(source)
         return _fail("oidc_state")
     if not _claim_state(payload["state"]):
         logger.warning("OIDC callback refused: state was already redeemed")
-        MINT_BUDGET.record(source)
+        CALLBACK_BUDGET.record(source)
         return _fail("oidc_state")
 
     # RFC 9207. Optional, and only a few providers send it, but when it is
@@ -343,12 +360,12 @@ def oidc_callback(request: Request) -> Response:
             "OIDC callback refused: the `iss` parameter does not match the "
             "configured issuer"
         )
-        MINT_BUDGET.record(source)
+        CALLBACK_BUDGET.record(source)
         return _fail("oidc_state")
 
     code = params.get("code") or ""
     if not code:
-        MINT_BUDGET.record(source)
+        CALLBACK_BUDGET.record(source)
         return _fail("oidc_state")
 
     try:
@@ -377,10 +394,10 @@ def oidc_callback(request: Request) -> Response:
         groups = oidc_module.check_groups(cfg, userinfo, id_claims)
     except oidc_module.OidcError as exc:
         logger.warning("OIDC login failed (%s): %s", exc.code, exc)
-        MINT_BUDGET.record(source)
+        CALLBACK_BUDGET.record(source)
         return _fail(exc.code)
 
-    MINT_BUDGET.clear(source)
+    CALLBACK_BUDGET.clear(source)
     logger.info(
         "OIDC login accepted for %s (groups: %s)",
         oidc_module.subject_label(userinfo, id_claims),

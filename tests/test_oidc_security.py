@@ -236,3 +236,45 @@ def test_a_login_flood_does_not_lock_out_the_secret_login(oidc_client, idp):
     assert oidc_client.post(
         "/auth/session", json={"token": UI_TOKEN}
     ).status_code == 204
+
+
+# --- 2: a callback flood must not spend the shared-secret budget -----------
+
+
+def test_a_callback_flood_does_not_lock_out_the_secret_login(client, tmp_path):
+    """Finding 2, inverted PoC E.
+
+    100 cross-site GETs — no credential, no cookie, free to send — used to
+    exhaust `auth`'s *global* mint budget, so the correct UI secret then got
+    a 429. The two paths now keep separate accounting.
+    """
+    configure_oidc(tmp_path)
+    auth_module.MINT_BUDGET.reset()
+    oidc_routes.CALLBACK_BUDGET.reset()
+    for i in range(100):
+        response = client.get(
+            f"/auth/oidc/callback?state=x{i}&code=y", follow_redirects=False
+        )
+        assert response.status_code == 302
+    response = client.post("/auth/session", json={"token": UI_TOKEN})
+    print("POST /auth/session with the correct secret ->", response.status_code)
+    assert response.status_code == 204
+
+
+def test_a_secret_login_flood_does_not_lock_out_the_callback(
+    oidc_client, idp, tmp_path
+):
+    """Finding 2, the other direction. Separate means separate both ways."""
+    auth_module.MINT_BUDGET.reset()
+    oidc_routes.CALLBACK_BUDGET.reset()
+    for i in range(auth_module.MINT_FAIL_LIMIT + 5):
+        client_status = oidc_client.post(
+            "/auth/session", json={"token": f"guess-{i}"}
+        ).status_code
+        assert client_status in (401, 429)
+    assert oidc_client.post(
+        "/auth/session", json={"token": UI_TOKEN}
+    ).status_code == 429
+    # ...and SSO is entirely unaffected.
+    assert run_flow(oidc_client, idp).headers["location"] == "/auth/oidc/complete"
+    auth_module.MINT_BUDGET.reset()

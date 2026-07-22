@@ -102,6 +102,7 @@ def _reset_process_state() -> None:
 
     oidc_module.reset_caches()
     oidc_routes.reset_state_store()
+    oidc_routes.CALLBACK_BUDGET.reset()
     oidc_routes.LOGIN_BUDGET.reset()
 
 
