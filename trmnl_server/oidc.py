@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import threading
 import time
@@ -350,8 +351,6 @@ def authorization_url(
 
 
 def code_challenge_for(verifier: str) -> str:
-    import hashlib
-
     return b64url(hashlib.sha256(verifier.encode("ascii")).digest())
 
 
