@@ -53,6 +53,7 @@ import json
 import secrets
 import threading
 import time
+from collections import OrderedDict
 from typing import Any
 
 from fastapi import APIRouter, Request, Response
@@ -118,22 +119,72 @@ STATE_VERSION = "o1"
 # with the same underlying secret.
 _STATE_KEY_CONTEXT = b"trmnl-oidc-state-v1"
 
-# States that have already been redeemed. The cookie is cleared on every
-# callback, which alone defeats a replay from a *fresh* browser; this also
-# defeats one from the same browser (the back button, a duplicated tab, a
-# proxy that retries), where the cookie is still in flight.
-_USED_STATE_MAX = 1024
-_used_states: dict[str, float] = {}
-# Sync `def` handlers run in FastAPI's threadpool, so two callbacks carrying
-# the same state really can be in `_claim_state` at once. Without this lock
-# the check-then-set is a race and "single use" means "usually single use".
-_used_lock = threading.Lock()
+# Every state entry lives STATE_TTL seconds and `/auth/oidc/login` is rate
+# limited, so this bounds the ledger at far more entries than the login budget
+# can produce in one TTL. Sized generously on purpose: see `_StateLedger`.
+_USED_STATE_MAX = 16384
 
 
-def reset_state_store() -> None:
-    """Drop the single-use state ledger. Called by the test suite."""
-    with _used_lock:
-        _used_states.clear()
+class _StateLedger:
+    """States that have already been redeemed, so none is redeemed twice.
+
+    The state cookie is cleared on every callback, which alone defeats a
+    replay from a *fresh* browser. This ledger defeats one from the same
+    browser — the back button, a duplicated tab, a proxy that retries — where
+    the cookie is still in flight.
+
+    **There is deliberately no way to empty it.** The previous version cleared
+    the whole dict on reaching its bound, which turned "single use" into "single
+    use unless you first redeem a thousand states": an attacker could mint
+    states from `/auth/oidc/login` at will, spend them to trip the flush, and
+    then replay a state the ledger had forgotten. A flush primitive on a
+    single-use ledger *is* the bypass.
+
+    So eviction is FIFO by insertion, which is very nearly by expiry since
+    every entry has the same TTL — the entry dropped is the one closest to
+    ageing out anyway — and the bound is high enough that the rate limiter on
+    `/auth/oidc/login` cannot fill it within one TTL. The test suite gets a
+    fresh instance rather than a flush; `reset_state_store()` is gone.
+    """
+
+    def __init__(self, maximum: int = _USED_STATE_MAX) -> None:
+        self._maximum = maximum
+        self._entries: OrderedDict[str, float] = OrderedDict()
+        # Sync `def` handlers run in FastAPI's threadpool, so two callbacks
+        # carrying the same state really can be in `claim()` at once. Without
+        # this lock the check-then-set is a race and "single use" means
+        # "usually single use".
+        self._lock = threading.Lock()
+
+    def claim(self, state: str) -> bool:
+        """True the first time `state` is redeemed, False every time after."""
+        now = time.monotonic()
+        with self._lock:
+            # Expired entries first, and *before* the membership test, so a
+            # full ledger can never answer by evicting the very state being
+            # asked about — which is how a bound turns into a bypass.
+            while self._entries and next(iter(self._entries.values())) <= now:
+                self._entries.popitem(last=False)
+            if state in self._entries:
+                return False
+            while len(self._entries) >= self._maximum:
+                self._entries.popitem(last=False)
+                logger.warning(
+                    "the OIDC single-use state ledger is at its %d-entry "
+                    "bound and is evicting an unexpired state; either this "
+                    "server is under a login flood or STATE_TTL is too long "
+                    "for its traffic",
+                    self._maximum,
+                )
+            self._entries[state] = now + STATE_TTL
+            return True
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+
+_state_ledger = _StateLedger()
 
 
 def _state_key(secret: str) -> bytes:
@@ -192,22 +243,6 @@ def _unpack_state(secret: str, raw: str) -> dict[str, Any] | None:
         if not isinstance(payload.get(key), str) or not payload[key]:
             return None
     return payload
-
-
-def _claim_state(state: str) -> bool:
-    """True the first time `state` is redeemed, False every time after."""
-    now = time.monotonic()
-    with _used_lock:
-        for key in [k for k, expiry in _used_states.items() if expiry <= now]:
-            _used_states.pop(key, None)
-        if state in _used_states:
-            return False
-        if len(_used_states) >= _USED_STATE_MAX:
-            # Bounded rather than unbounded: the entries expire in STATE_TTL
-            # anyway, and a flood of unredeemed states must not become a leak.
-            _used_states.clear()
-        _used_states[state] = now + STATE_TTL
-        return True
 
 
 def _set_state_cookie(response: Response, value: str) -> None:
@@ -344,7 +379,7 @@ def oidc_callback(request: Request) -> Response:
         )
         CALLBACK_BUDGET.record(source)
         return _fail("oidc_state")
-    if not _claim_state(payload["state"]):
+    if not _state_ledger.claim(payload["state"]):
         logger.warning("OIDC callback refused: state was already redeemed")
         CALLBACK_BUDGET.record(source)
         return _fail("oidc_state")
