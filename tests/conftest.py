@@ -92,8 +92,7 @@ def _reset_process_state() -> None:
 
     panel_module._log_buckets.clear()
     panel_module._log_global_hits.clear()
-    auth_module._mint_failures.clear()
-    auth_module._mint_global_failures.clear()
+    auth_module.MINT_BUDGET.reset()
 
     # Same argument for the discovery cache and the single-use state ledger:
     # a document fetched by one test's fake IdP would otherwise still be
@@ -103,6 +102,7 @@ def _reset_process_state() -> None:
 
     oidc_module.reset_caches()
     oidc_routes.reset_state_store()
+    oidc_routes.LOGIN_BUDGET.reset()
 
 
 @pytest.fixture()

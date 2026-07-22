@@ -848,34 +848,30 @@ def test_logout_is_origin_pinned(ui_client):
 def test_session_mint_is_throttled_after_repeated_failures(client):
     from trmnl_server.routes import auth as auth_module
 
-    auth_module._mint_failures.clear()
-    auth_module._mint_global_failures.clear()
+    auth_module.MINT_BUDGET.reset()
     codes = [
         client.post("/auth/session", json={"token": f"guess-{i}"}).status_code
-        for i in range(auth_module._MINT_FAIL_LIMIT + 5)
+        for i in range(auth_module.MINT_FAIL_LIMIT + 5)
     ]
-    assert codes[: auth_module._MINT_FAIL_LIMIT] == [401] * auth_module._MINT_FAIL_LIMIT
-    assert set(codes[auth_module._MINT_FAIL_LIMIT :]) == {429}
+    assert codes[: auth_module.MINT_FAIL_LIMIT] == [401] * auth_module.MINT_FAIL_LIMIT
+    assert set(codes[auth_module.MINT_FAIL_LIMIT :]) == {429}
     # Throttled means throttled: the right secret does not get through either.
     assert client.post("/auth/session", json={"token": UI_TOKEN}).status_code == 429
-    auth_module._mint_failures.clear()
-    auth_module._mint_global_failures.clear()
+    auth_module.MINT_BUDGET.reset()
 
 
 def test_a_successful_login_clears_the_failure_counter(client):
     """One fat-fingered secret must not lock the operator out later."""
     from trmnl_server.routes import auth as auth_module
 
-    auth_module._mint_failures.clear()
-    auth_module._mint_global_failures.clear()
-    for _ in range(auth_module._MINT_FAIL_LIMIT - 1):
+    auth_module.MINT_BUDGET.reset()
+    for _ in range(auth_module.MINT_FAIL_LIMIT - 1):
         assert client.post("/auth/session", json={"token": "nope"}).status_code == 401
     assert client.post("/auth/session", json={"token": UI_TOKEN}).status_code == 204
-    for _ in range(auth_module._MINT_FAIL_LIMIT - 1):
+    for _ in range(auth_module.MINT_FAIL_LIMIT - 1):
         assert client.post("/auth/session", json={"token": "nope"}).status_code == 401
     assert client.post("/auth/session", json={"token": UI_TOKEN}).status_code == 204
-    auth_module._mint_failures.clear()
-    auth_module._mint_global_failures.clear()
+    auth_module.MINT_BUDGET.reset()
 
 
 def test_origin_pin_ignores_a_client_supplied_host(ui_client):
