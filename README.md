@@ -137,18 +137,39 @@ Setting `TRMNL_OIDC_ISSUER` enables the feature.
 is nothing to derive the redirect URI from and nothing to allowlist it
 against. Register `https://<your-host>/auth/oidc/callback` with the provider.
 
-Every flow uses PKCE `S256`; `state` is signed, single-use, bound to the PKCE
-verifier and expires in five minutes; `nonce` is sent and checked. There is
-no `next` or `redirect_uri` parameter on `/auth/oidc/login` — the destination
-is always this server's own `/`.
+**https is required** — for the issuer, for the redirect URI, and for every
+endpoint the discovery document points at. Plaintext `http://` is accepted
+only when the host is loopback (`127.0.0.0/8`, `::1`, `localhost` and
+`*.localhost`), so a laptop running both the server and an IdP still works.
+Anything else disables OIDC with a message saying so. The reason is in the
+next paragraph: skipping the ID-token signature is only sound over TLS.
 
-Zero new dependencies. Local ID-token signature verification is deliberately
-skipped under **OIDC Core §3.1.3.7 item 6** (the token is received directly
-from the token endpoint over TLS with client authentication); identity is read
-from the `userinfo` endpoint, which is an authenticated call in its own right.
-The corollary is that a **signed** userinfo response (`Content-Type:
-application/jwt`) is *refused* rather than consumed unverified — leave your
-provider's userinfo signing algorithm at `none`.
+Every flow uses PKCE `S256`, and the provider has to *advertise* `S256` in
+`code_challenge_methods_supported` or the flow is refused — a provider that
+silently ignores PKCE is otherwise indistinguishable from one that honours it.
+`plain` is never used even when offered. `state` is signed, single-use, bound
+to the PKCE verifier and expires in five minutes; `nonce` is sent and checked.
+There is no `next` or `redirect_uri` parameter on `/auth/oidc/login` — the
+destination is always this server's own `/`.
+
+Zero new dependencies. Local ID-token **signature** verification is
+deliberately skipped under **OIDC Core §3.1.3.7 item 6** (the token is
+received directly from the token endpoint over TLS with client
+authentication). Its **claims** are not skipped: `iss` must be the configured
+or advertised issuer, `aud` must contain the client ID, `azp` (when present)
+must equal it, and `exp`/`iat` must be sane within two minutes of clock skew.
+Identity is then read from the `userinfo` endpoint, which is an authenticated
+call in its own right and whose `sub` must match the ID token's exactly
+(OIDC Core §5.3.2). The corollary of not verifying signatures is that a
+**signed** userinfo response (`Content-Type: application/jwt`) is *refused*
+rather than consumed unverified — leave your provider's userinfo signing
+algorithm at `none`.
+
+Both `/auth/oidc/login` and `/auth/oidc/callback` are rate limited, on
+counters separate from `POST /auth/session`'s, so traffic against one login
+path can never lock you out of the other. Outbound calls to the provider are
+capped at eight concurrent and every response body at 256 KiB, because the
+panel's own endpoints share this process's threadpool and memory.
 
 A discovery outage never locks you out: it disables the OIDC button and
 nothing else. Keep `TRMNL_UI_TOKEN_FILE` configured as a way back in until
