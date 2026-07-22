@@ -1053,7 +1053,45 @@
     return html`<div class=${`container ${activeTab === id ? 'active' : ''}`} id=${`container_${id}`}>${children}</div>`;
   }
 
+  // Countdown to the panel's next expected poll.
+  //
+  // Deliberately never returns a negative value. The ESP32 sleeps on its own
+  // timer and routinely wakes a little late, so a passed deadline means "due,
+  // waiting for it to check in" — not "-00:42". Ticks once a second, and only
+  // while a deadline is actually set.
+  function useNextRefreshCountdown(nextRefreshAt) {
+    const [now, setNow] = useState(() => Date.now());
+    useEffect(() => {
+      if (!nextRefreshAt) {
+        return undefined;
+      }
+      const timer = setInterval(() => setNow(Date.now()), 1000);
+      return () => clearInterval(timer);
+    }, [nextRefreshAt]);
+
+    if (!nextRefreshAt) {
+      return { label: 'N/A', overdue: false };
+    }
+    const due = new Date(nextRefreshAt).getTime();
+    if (Number.isNaN(due)) {
+      return { label: 'N/A', overdue: false };
+    }
+    const remaining = Math.round((due - now) / 1000);
+    if (remaining <= 0) {
+      return { label: 'due now', overdue: true };
+    }
+    const minutes = Math.floor(remaining / 60);
+    const seconds = remaining % 60;
+    return {
+      label: `in ${minutes}:${String(seconds).padStart(2, '0')}`,
+      overdue: false
+    };
+  }
+
   function HomeTab({ status, devices, onSelectDevice, selectedDeviceId }) {
+    const client = status.client || {};
+    const nextRefresh = useNextRefreshCountdown(client.next_refresh_at);
+    const nowShowing = client.now_showing || null;
     const serverTimeDisplay = formatDisplayTimestamp(status.server.current_time);
     const deviceList = normalizeDevicesList((devices && devices.length ? devices : status.devices) || []);
     const effectiveSelectedId = selectedDeviceId || status.client.device_id || 'default';
@@ -1092,6 +1130,14 @@
             <div class="status-item"><p class="status-name">Current Time:</p><p>${serverTimeDisplay}</p></div>
             <div class="status-item"><p class="status-name">Uptime:</p><p>${status.server.uptime}</p></div>
             <div class="status-item"><p class="status-name">Devices Online:</p><p>${deviceList.length}</p></div>
+            <div class="status-item">
+              <p class="status-name">Now Showing:</p>
+              <p>${nowShowing || 'Nothing collected yet'}</p>
+            </div>
+            <div class="status-item">
+              <p class="status-name">Next Refresh:</p>
+              <p class=${nextRefresh.overdue ? 'refresh-overdue' : ''}>${nextRefresh.label}</p>
+            </div>
           </div>
         </div>
       </${Fragment}>

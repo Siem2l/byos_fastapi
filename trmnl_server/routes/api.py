@@ -80,6 +80,42 @@ def _cpu_load_percent() -> float:
     return round(min(100.0, load1 / max(1, cpu_count() or 1) * 100.0), 1)
 
 
+def _screen_title_for_plugin(plugin_name: Optional[str]) -> Optional[str]:
+    """Human title of the screen a rotation plugin renders, for "Now showing".
+
+    Imported lazily for the same reason `main.py` defers the plugin import:
+    building the registry instantiates every plugin class.
+    """
+    if not plugin_name:
+        return None
+    try:
+        from ..plugins.garmin import SLUG_BY_PLUGIN
+        from ..screens import base as screens_base
+
+        slug = SLUG_BY_PLUGIN.get(plugin_name)
+        if not slug:
+            return None
+        screen_cls = screens_base.REGISTRY.get(slug)
+        return (getattr(screen_cls, 'title', '') or slug) if screen_cls else slug
+    except Exception:  # noqa: BLE001 - a label must never break /status
+        logger.warning("could not resolve screen title for %r", plugin_name)
+        return None
+
+
+def _next_refresh_at(last_contact: Any, refresh_interval: Optional[int]) -> Optional[str]:
+    """When the panel is next due to poll, or None if it never has.
+
+    Advisory only. The ESP32 sleeps on its own timer and wakes late as often
+    as not, so the UI treats a passed deadline as "due now", never as a
+    negative countdown.
+    """
+    if not isinstance(last_contact, (int, float)) or last_contact <= 0:
+        return None
+    if not isinstance(refresh_interval, (int, float)) or refresh_interval <= 0:
+        return None
+    return utils.to_iso_timestamp(last_contact + refresh_interval)
+
+
 def _serialize_device_payload(device_id: str) -> Dict[str, Any]:
     profile = state.ensure_device_profile(device_id)
     metrics = state.get_client_metrics(device_id)
@@ -374,6 +410,8 @@ def status_view(device_id: Optional[str] = Query(None, alias='device_id')) -> JS
     current_entry_hash = device_state.get('last_entry_hash')
     current_preview_url = device_state.get('current_preview_url')
     current_preview_token = device_state.get('current_preview_token')
+    now_showing = _screen_title_for_plugin(device_state.get('last_entry_plugin'))
+    next_refresh_at = _next_refresh_at(metrics.get('last_contact'), refresh_interval)
 
     metrics_store = state.get_all_client_metrics()
 
@@ -419,7 +457,13 @@ def status_view(device_id: Optional[str] = Query(None, alias='device_id')) -> JS
             'current_entry_hash': current_entry_hash,
             'current_plugin_id': device_state.get('last_entry_plugin'),
             'current_preview_url': current_preview_url,
-            'current_preview_token': current_preview_token
+            'current_preview_token': current_preview_token,
+            # Dashboard extras. `now_showing` is the human title of whatever
+            # frame the panel last collected; `next_refresh_at` is when it is
+            # due back. Both are null until the device has actually polled —
+            # the UI must not invent a countdown from nothing.
+            'now_showing': now_showing,
+            'next_refresh_at': next_refresh_at
         },
         'devices': devices_summary,
         'playlists': playlists_summary,
