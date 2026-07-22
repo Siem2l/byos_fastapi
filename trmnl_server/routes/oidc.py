@@ -396,6 +396,8 @@ def oidc_callback(request: Request) -> Response:
                 "sent, so the response does not belong to this login attempt",
             )
         userinfo = oidc_module.fetch_userinfo(document, tokens["access_token"])
+        # Before any claim in it is read, let alone used for authorization.
+        oidc_module.bind_userinfo_subject(userinfo, id_claims)
         groups = oidc_module.check_groups(cfg, userinfo, id_claims)
     except oidc_module.OidcError as exc:
         logger.warning("OIDC login failed (%s): %s", exc.code, exc)
