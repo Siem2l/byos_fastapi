@@ -7,13 +7,29 @@ from pathlib import Path
 from .canvas import Canvas
 from .config import Config
 from .screens import Context, get
-from .sources import GarminSource, SyntheticGarminSource
+from .sources import (
+    GarminSource,
+    PrometheusSource,
+    SyntheticGarminSource,
+    SyntheticPrometheusSource,
+)
 
 
 def build_sources(config: Config, *, synthetic: bool = False) -> dict:
     if synthetic or config.synthetic:
-        return {"garmin": SyntheticGarminSource()}
-    return {"garmin": GarminSource(config.garmin_db_dir)}
+        return {
+            "garmin": SyntheticGarminSource(),
+            "prometheus": SyntheticPrometheusSource(),
+        }
+    return {
+        "garmin": GarminSource(config.garmin_db_dir),
+        # Always constructed, even with no URL configured: the source
+        # knows it is switched off and says so when asked, which turns
+        # an unconfigured deployment into one legible notice on the
+        # glass instead of a LookupError from `ctx.source()` that reads
+        # as a missing screen.
+        "prometheus": PrometheusSource(config.prometheus_url),
+    }
 
 
 def render_screen(
