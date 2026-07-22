@@ -1,0 +1,11 @@
+; Configuration for the `Pylint` GitHub workflow, which lints every tracked
+; `*.py` and fails the build below 9.00/10.
+;
+; Deliberately one setting. Everything else pylint reports is either a real
+; message or is silenced at the site that knows why, with a comment.
+
+[MAIN]
+; The package declares `requires-python = ">=3.11"` in pyproject.toml, so
+; pylint should judge the code against that rather than against whichever
+; interpreter the workflow matrix happens to be running.
+py-version = 3.11
