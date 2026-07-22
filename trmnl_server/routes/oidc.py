@@ -384,6 +384,11 @@ def oidc_callback(request: Request) -> Response:
                 "oidc_provider", "token response carried no id_token"
             )
         id_claims = oidc_module.decode_jwt_claims(raw_id_token)
+        # Signature: deliberately unchecked, per OIDC Core §3.1.3.7 item 6 and
+        # the oidc.py module docstring. *Claims*: checked, because item 6 is
+        # one item and the rest of §3.1.3.7 is the part that says this token
+        # was minted for this client, by this issuer, and has not expired.
+        oidc_module.validate_id_claims(cfg, document, id_claims)
         if not secret_equal(id_claims.get("nonce"), payload["nonce"]):
             raise oidc_module.OidcError(
                 "oidc_nonce",

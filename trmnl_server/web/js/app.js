@@ -142,6 +142,8 @@
       'The identity provider could not be reached, or it refused the sign-in.',
     oidc_nonce:
       'The provider\u2019s response did not belong to this sign-in attempt.',
+    oidc_claims:
+      'The provider\u2019s identity token was rejected: it names a different issuer or application, or it has expired. Check that this server\u2019s issuer and client ID match the ones configured at the provider.',
     oidc_group: 'Your account is not in an allowed group.',
     oidc_group_claim_missing:
       'The identity provider returned no groups claim. Check that the scope granting group membership is requested, and that the claim is included in the userinfo response.',

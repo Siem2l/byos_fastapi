@@ -110,13 +110,38 @@ LOGIN_ERROR_CODES = frozenset({
     "oidc_group_claim_missing",
     "oidc_userinfo_jwt",
     "oidc_throttled",
+    "oidc_claims",
 })
+
+# OIDC Core §3.1.3.7 item 10 leaves the acceptable clock skew to the client.
+# Two minutes: large enough that a provider without NTP does not lock everyone
+# out, small enough that an expired token is not usable for a working day.
+CLOCK_SKEW = 120
 
 # Distinguishes "the claim is not there" from "the claim is there and empty",
 # which is the difference between "your IdP is not sending groups" and "your
 # account is in no allowed group" — the single most useful thing this feature
 # can tell a misconfigured operator.
 MISSING = object()
+
+
+def redact(value: object, limit: int = 120) -> str:
+    """A log-safe rendering of something the identity provider chose.
+
+    Three jobs, all of them about the *log* being an attacker-writable file:
+    control characters (a newline above all) are escaped so a hostile claim
+    cannot forge a second log line; the result is truncated so a megabyte of
+    JSON cannot fill the journal; and the whole thing is `repr`-quoted so the
+    boundaries of the untrusted span are visible.
+
+    Never pass a credential through here — a truncated secret is still a
+    leaked prefix. Tokens, authorization codes and the client secret are not
+    logged at all, at any length.
+    """
+    text = value if isinstance(value, str) else repr(value)
+    if len(text) > limit:
+        text = text[:limit] + f"...(+{len(text) - limit} more)"
+    return repr(text)
 
 
 class OidcError(RuntimeError):
@@ -559,6 +584,112 @@ def decode_jwt_claims(token: str) -> dict[str, Any]:
     if not isinstance(claims, dict):
         raise OidcError("oidc_provider", "id_token payload is not a JSON object")
     return claims
+
+
+def _expected_issuers(cfg: Config, doc: dict[str, Any]) -> list[str]:
+    """The issuer values an ID token is allowed to claim.
+
+    Normally one: the configured issuer, which per OIDC Discovery §4.3 must
+    equal the document's own `issuer`. This fork tolerates them differing
+    because authentik in *global* issuer mode advertises its root URL while
+    serving discovery under `/application/o/<slug>/` — see
+    `_discovery_problem`. So the accepted set is those two values and nothing
+    else: both are operator- or discovery-derived, neither is attacker-chosen.
+    """
+    expected = [normalise_issuer(cfg.oidc_issuer)]
+    advertised = normalise_issuer(str(doc.get("issuer") or ""))
+    if advertised and advertised not in expected:
+        expected.append(advertised)
+    return expected
+
+
+def validate_id_claims(
+    cfg: Config, doc: dict[str, Any], claims: dict[str, Any]
+) -> None:
+    """Check the ID token's `iss`, `aud`, `azp`, `exp` and `sub`.
+
+    **Not** signature verification — see the module docstring. §3.1.3.7 item 6
+    licenses skipping *item 6*, the signature, when the token came straight
+    back from the token endpoint over TLS with client authentication. It says
+    nothing about items 1-5 and 8-13, which are the claim checks below, and
+    those are exactly what stop a token minted for another client or another
+    issuer, or one that expired last week, from being accepted here.
+
+    Raises `OidcError("oidc_claims", ...)` and never returns a verdict, so a
+    caller cannot forget to look at the result.
+    """
+    client_id = cfg.oidc_client_id
+
+    # §3.1.3.7 item 2: the issuer must be the one this flow was started with.
+    expected_issuers = _expected_issuers(cfg, doc)
+    issuer = normalise_issuer(str(claims.get("iss") or ""))
+    if not issuer:
+        raise OidcError("oidc_claims", "the id_token carries no `iss` claim")
+    if issuer not in expected_issuers:
+        raise OidcError(
+            "oidc_claims",
+            f"the id_token's `iss` ({redact(issuer)}) is not this server's "
+            f"configured issuer ({expected_issuers!r})",
+        )
+
+    # §3.1.3.7 item 3: `aud` must contain this client.
+    audience = claims.get("aud")
+    if isinstance(audience, str):
+        audiences = [audience]
+    elif isinstance(audience, (list, tuple)):
+        audiences = [a for a in audience if isinstance(a, str)]
+    else:
+        audiences = []
+    if not audiences:
+        raise OidcError("oidc_claims", "the id_token carries no usable `aud` claim")
+    if client_id not in audiences:
+        raise OidcError(
+            "oidc_claims",
+            f"the id_token's `aud` ({redact(audiences)}) does not contain this "
+            f"server's client_id ({client_id!r}) — it was minted for a "
+            "different client",
+        )
+
+    # §3.1.3.7 items 4 and 5: with more than one audience `azp` is required,
+    # and whenever it is present it must be this client.
+    azp = claims.get("azp")
+    if azp is not None and azp != client_id:
+        raise OidcError(
+            "oidc_claims",
+            f"the id_token's `azp` ({redact(azp)}) is not this server's "
+            f"client_id ({client_id!r})",
+        )
+    if len(audiences) > 1 and azp is None:
+        raise OidcError(
+            "oidc_claims",
+            "the id_token has multiple audiences but no `azp` claim, so there "
+            "is nothing to say it was authorized for this client",
+        )
+
+    # §3.1.3.7 item 9: not expired, with a small skew allowance.
+    now = time.time()
+    try:
+        expires_at = int(claims["exp"])
+    except (KeyError, TypeError, ValueError):
+        raise OidcError(
+            "oidc_claims", "the id_token carries no usable `exp` claim"
+        ) from None
+    if expires_at + CLOCK_SKEW <= now:
+        raise OidcError(
+            "oidc_claims",
+            f"the id_token expired {int(now - expires_at)}s ago",
+        )
+    # §3.1.3.7 item 10: an `iat` far in the future is a broken or hostile clock.
+    issued_at = claims.get("iat")
+    if isinstance(issued_at, (int, float)) and issued_at - CLOCK_SKEW > now:
+        raise OidcError(
+            "oidc_claims",
+            f"the id_token was issued {int(issued_at - now)}s in the future",
+        )
+
+    subject = claims.get("sub")
+    if not isinstance(subject, str) or not subject.strip():
+        raise OidcError("oidc_claims", "the id_token carries no `sub` claim")
 
 
 def fetch_userinfo(doc: dict[str, Any], access_token: str) -> dict[str, Any]:

@@ -278,3 +278,89 @@ def test_a_secret_login_flood_does_not_lock_out_the_callback(
     # ...and SSO is entirely unaffected.
     assert run_flow(oidc_client, idp).headers["location"] == "/auth/oidc/complete"
     auth_module.MINT_BUDGET.reset()
+
+
+# --- 3: the ID token's claims are checked, even though its signature is not -
+
+
+class ForgedClaimsIdp(FakeIdp):
+    """A provider that mints a token for someone else, and expired at that."""
+
+    def __init__(self, **overrides) -> None:
+        self.claim_overrides = overrides.pop("claim_overrides", {})
+        super().__init__(**overrides)
+
+    def _claims(self, sub: str, *, nonce: str | None) -> dict:
+        claims = super()._claims(sub, nonce=nonce)
+        claims.update(self.claim_overrides)
+        return claims
+
+
+@pytest.mark.parametrize(
+    "overrides,why",
+    [
+        (
+            {
+                "iss": "https://totally-other-issuer.example",
+                "aud": "some-other-client",
+                "azp": "some-other-client",
+                "exp": int(time.time()) - 86400,
+                "iat": int(time.time()) - 172800,
+            },
+            "the original PoC B: wrong issuer, wrong audience, expired",
+        ),
+        ({"iss": "https://totally-other-issuer.example"}, "wrong issuer"),
+        ({"iss": ""}, "no issuer"),
+        ({"aud": "some-other-client"}, "wrong audience"),
+        ({"aud": []}, "empty audience"),
+        ({"aud": None}, "no audience"),
+        ({"azp": "some-other-client"}, "wrong authorized party"),
+        ({"aud": ["trmnl", "another-client"]}, "multiple audiences, no azp"),
+        ({"exp": int(time.time()) - 86400}, "expired a day ago"),
+        ({"exp": int(time.time()) - 600}, "expired well past the skew window"),
+        ({"exp": "soon"}, "unparseable exp"),
+        ({"exp": None}, "no exp"),
+        ({"iat": int(time.time()) + 86400}, "issued a day in the future"),
+        ({"sub": ""}, "no subject"),
+    ],
+)
+def test_a_forged_id_token_is_refused(client, tmp_path, overrides, why):
+    """Finding 3, inverted PoC B.
+
+    Skipping the *signature* is what §3.1.3.7 item 6 permits when the token
+    came straight back from the token endpoint over TLS. Skipping the *claims*
+    was never covered by that, and without them any provider — or anyone who
+    can make this server talk to one — can mint an admin session.
+    """
+    configure_oidc(tmp_path)
+    forged = ForgedClaimsIdp(claim_overrides=overrides)
+    install_idp(forged)
+    response = run_flow(client, forged)
+    assert response.headers["location"] == "/?login_error=oidc_claims", why
+    assert "trmnl_ui" not in response.headers.get("set-cookie", "")
+    assert client.get("/status").status_code == 401
+
+
+def test_a_token_within_the_clock_skew_window_still_works(client, tmp_path):
+    """The skew allowance is real, or a provider without NTP locks everyone out."""
+    configure_oidc(tmp_path)
+    fresh = ForgedClaimsIdp(claim_overrides={"exp": int(time.time()) - 30})
+    install_idp(fresh)
+    assert run_flow(client, fresh).headers["location"] == "/auth/oidc/complete"
+
+
+def test_the_advertised_issuer_is_accepted_as_well_as_the_configured_one(
+    client, tmp_path
+):
+    """authentik in global issuer mode advertises an `iss` of its own.
+
+    Rejecting it would break a provider this feature exists to support, so the
+    accepted set is exactly those two values — and nothing else.
+    """
+    configure_oidc(tmp_path)
+    authentik = ForgedClaimsIdp(
+        advertised_issuer="https://authentik.example",
+        claim_overrides={"iss": "https://authentik.example"},
+    )
+    install_idp(authentik)
+    assert run_flow(client, authentik).headers["location"] == "/auth/oidc/complete"
