@@ -3,6 +3,9 @@
 These pin the behaviours the real panel depends on: both trailing-slash
 spellings, the MAC allowlist on /api/setup, the Access-Token check on
 /api/display, unguessable image paths, and a token-gated browser preview.
+
+The `client` / `ui_client` fixtures and the constants below live in
+`conftest.py` so `test_oidc.py` exercises the same app these tests do.
 """
 
 from __future__ import annotations
@@ -11,99 +14,10 @@ import os
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 from PIL import Image
 
-from trmnl_server import config as config_module  # noqa: E402
-from trmnl_server.config import Config  # noqa: E402
-from trmnl_server.main import create_app  # noqa: E402
+from conftest import MAC, TOKEN, UI_TOKEN  # noqa: F401  (used throughout)
 from trmnl_server import models  # noqa: E402
-
-MAC = "E0:72:A1:FA:42:F0"
-TOKEN = "test-token"
-UI_TOKEN = "test-ui-token"
-
-
-def _reset_process_state() -> None:
-    """Clear the module-global rotation/plugin caches between apps.
-
-    `services.state` is process-global and the plugin scheduler caches
-    `PluginOutput` paths in it. Production runs one app per process, but the
-    suite builds several, and pytest keeps the last few tmp_path trees alive
-    — so a stale cache entry whose files still exist on disk passes the
-    scheduler's `_assets_exist()` staleness check, the plugin never re-runs
-    under the new generated root, and `path_to_web_url()` returns None for
-    every rotation entry. Cheaper to reset than to make the cache
-    root-aware.
-    """
-    from trmnl_server.services import state as state_module
-
-    with state_module.STATE_LOCK:
-        state_module.global_state['plugins'] = {}
-        state_module.global_state['rotation_master'] = {
-            'bmp_entries': [],
-            'png_entries': [],
-            'hashes': [],
-            'meta': [],
-            'selected_ids': [],
-            'version': 0,
-            'has_persistent_playlist': False,
-        }
-        state_module.global_state['devices'] = {}
-        state_module.global_state['device_playlists'] = {}
-        state_module.global_state['named_playlists'] = {}
-        state_module.global_state['device_playlist_bindings'] = {}
-        # Profiles are cached in front of SQLite, and each test gets a fresh
-        # database — so without this a refresh_interval written by one test
-        # is still in memory for the next one, whose DB has never seen it.
-        state_module.global_state['device_profiles'] = {}
-
-    # The rate limiters are module-global sliding windows, so without this
-    # the suite's own traffic accumulates across the ~30 apps it builds and
-    # a later test gets a 429 for something an earlier test did.
-    from trmnl_server.routes import auth as auth_module
-    from trmnl_server.routes import panel as panel_module
-
-    panel_module._log_buckets.clear()
-    panel_module._log_global_hits.clear()
-    auth_module._mint_failures.clear()
-    auth_module._mint_global_failures.clear()
-
-
-@pytest.fixture()
-def client(tmp_path, monkeypatch):
-    # pin_database_path, not a plain assignment: create_app() calls
-    # pin_generated_assets_dir(), which refreshes every path constant and
-    # would otherwise recompute DATABASE_PATH back to $PWD/var/db.
-    config_module.pin_database_path(str(tmp_path / "trmnl.db"))
-    models.init_db()
-    _reset_process_state()
-
-    token_file = tmp_path / "token"
-    token_file.write_text(TOKEN)
-    ui_token_file = tmp_path / "ui-token"
-    ui_token_file.write_text(UI_TOKEN)
-    cfg = Config()
-    cfg.state_dir = str(tmp_path / "frames")
-    cfg.allowed_devices = ["e072a1fa42f0"]
-    cfg.token_file = str(token_file)
-    cfg.ui_token_file = str(ui_token_file)
-    cfg.base_url = "https://trmnl.example"
-    cfg.synthetic = True
-    # Same origin as cfg.base_url, and https: the session cookie carries
-    # Secure whenever the deployment is TLS, so an http test client would
-    # silently drop it and every control-plane test would pass for the wrong
-    # reason.
-    with TestClient(create_app(cfg), base_url="https://trmnl.example") as c:
-        yield c
-
-
-@pytest.fixture()
-def ui_client(client):
-    """A client holding a valid control-plane session cookie."""
-    resp = client.post("/auth/session", json={"token": UI_TOKEN})
-    assert resp.status_code == 204
-    return client
 
 
 def test_healthz(client):

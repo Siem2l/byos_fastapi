@@ -422,6 +422,58 @@ class Config:
     base_url: str = field(default_factory=lambda: environ.get(
         'TRMNL_BASE_URL', '').rstrip('/'))
 
+    # --- OIDC: the second way to mint the same session ---------------------
+    #
+    # Entirely optional and entirely discovery-driven: the presence of
+    # `TRMNL_OIDC_ISSUER` is what turns the feature on, and every endpoint is
+    # read out of `<issuer>/.well-known/openid-configuration` rather than
+    # configured by hand, which is what makes one code path work across
+    # authentik, Keycloak, Authelia, Pocket ID and Google.
+    #
+    # These are plain fields on Config, read through `panel_config()` at
+    # request time, so a test (or a future settings endpoint) can change them
+    # on the live object — see `trmnl_server/oidc.py`.
+    oidc_issuer: str = field(default_factory=lambda: environ.get(
+        'TRMNL_OIDC_ISSUER', '').strip())
+    oidc_client_id: str = field(default_factory=lambda: environ.get(
+        'TRMNL_OIDC_CLIENT_ID', '').strip())
+    # A file, like every other secret here, so it never lands in a unit file,
+    # `/proc/<pid>/environ` or `docker inspect`.
+    oidc_client_secret_file: str = field(default_factory=lambda: environ.get(
+        'TRMNL_OIDC_CLIENT_SECRET_FILE', '').strip())
+    # `groups` is in the default set deliberately. Requesting it costs
+    # nothing on authentik (unknown scopes are silently dropped) and is
+    # required on Authelia and Pocket ID; Keycloak rejects the authorization
+    # request outright with `invalid_scope` until the operator creates the
+    # matching client scope — which is a loud, self-describing failure on the
+    # IdP's own error page, and strictly better than the silent "you are not
+    # in an allowed group" that omitting it would produce everywhere else.
+    oidc_scopes: str = field(default_factory=lambda: (
+        environ.get('TRMNL_OIDC_SCOPES', '').strip()
+        or 'openid profile email groups'))
+    # Comma-separated. Empty means "any successfully authenticated user",
+    # which is the only workable default for an IdP with no group concept at
+    # all (Google). When it is non-empty the check fails closed.
+    oidc_allowed_groups: list[str] = field(default_factory=lambda: [
+        g.strip()
+        for g in environ.get('TRMNL_OIDC_ALLOWED_GROUPS', '').split(',')
+        if g.strip()
+    ])
+    # Claim holding the group list. A dotted value is tried as a flat key
+    # first and only then as a path, so an IdP that legitimately emits a
+    # claim with a dot in its name keeps working.
+    oidc_groups_claim: str = field(default_factory=lambda: (
+        environ.get('TRMNL_OIDC_GROUPS_CLAIM', '').strip() or 'groups'))
+    # Defaults to `<base_url>/auth/oidc/callback`. When set explicitly it
+    # must still sit under `base_url` — see `oidc.configuration_problem()`.
+    # Nothing caller-supplied ever reaches this value.
+    oidc_redirect_url: str = field(default_factory=lambda: environ.get(
+        'TRMNL_OIDC_REDIRECT_URL', '').strip())
+    # Display name for the "Sign in with ..." button. Falls back to the
+    # issuer's hostname, which is right often enough to be a sane default.
+    oidc_provider_name: str = field(default_factory=lambda: environ.get(
+        'TRMNL_OIDC_PROVIDER_NAME', '').strip())
+
     # Serve fabricated data instead of reading GarminDB. Lets the unit be
     # smoke-tested on a host where the import has not run yet.
     synthetic: bool = field(default_factory=lambda: bool(
@@ -463,6 +515,33 @@ class Config:
             )
         return value
 
+    @staticmethod
+    def _read_optional_secret(
+        env_name: str, path: str, consequence: str
+    ) -> str | None:
+        """Contents of a secret file, or None with a loud log line.
+
+        The None-on-fault shape (rather than `token()`'s raise) is only
+        correct where None is *already* fail-closed for every caller. Both
+        current users qualify: no session secret means the control plane
+        answers 503, and no OIDC client secret means OIDC is off.
+        """
+        if not path:
+            return None
+        try:
+            with open(path, encoding='utf-8') as fh:
+                value = fh.read().strip()
+        except OSError as exc:
+            logger.error(
+                '%s %r could not be read (%s) — %s', env_name, path, exc,
+                consequence,
+            )
+            return None
+        if not value:
+            logger.error('%s %r is empty — %s', env_name, path, consequence)
+            return None
+        return value
+
     def ui_token(self) -> str | None:
         """Secret that mints a control-plane session cookie.
 
@@ -476,24 +555,63 @@ class Config:
         there is no secret, and `create_session()` will not mint a cookie
         without one. The error is logged so the cause is not a mystery.
         """
-        if not self.ui_token_file:
-            return None
-        try:
-            with open(self.ui_token_file, encoding='utf-8') as fh:
-                value = fh.read().strip()
-        except OSError as exc:
-            logger.error(
-                'TRMNL_UI_TOKEN_FILE %r could not be read (%s) — the control '
-                'plane will refuse every request', self.ui_token_file, exc
-            )
-            return None
-        if not value:
-            logger.error(
-                'TRMNL_UI_TOKEN_FILE %r is empty — the control plane will '
-                'refuse every request', self.ui_token_file
-            )
-            return None
-        return value
+        return self._read_optional_secret(
+            'TRMNL_UI_TOKEN_FILE', self.ui_token_file,
+            'the shared-secret login path is unavailable',
+        )
+
+    def oidc_client_secret(self) -> str | None:
+        """The OIDC client secret, or None when OIDC cannot be used.
+
+        Same fail-closed shape as `ui_token()`: an unreadable or empty file
+        is a fault, and the fault disables the OIDC login path rather than
+        weakening it. The shared-secret path is untouched either way.
+        """
+        return self._read_optional_secret(
+            'TRMNL_OIDC_CLIENT_SECRET_FILE', self.oidc_client_secret_file,
+            'the OIDC login path is disabled',
+        )
+
+    def oidc_callback_url(self) -> str:
+        """Where the IdP is told to send the browser back to.
+
+        Derived from `base_url`, never from anything the caller sent. An
+        explicit `TRMNL_OIDC_REDIRECT_URL` still has to sit under `base_url`
+        (`oidc.configuration_problem()` refuses to enable the feature
+        otherwise), so there is no value of any environment variable — let
+        alone of any request — that turns this into an open redirect.
+        """
+        if self.oidc_redirect_url:
+            return self.oidc_redirect_url
+        return f"{self.base_url.rstrip('/')}/auth/oidc/callback"
+
+    def session_secret(self) -> str | None:
+        """Key material for the `trmnl_ui` cookie, from either login path.
+
+        The cookie's HMAC key is derived from a secret this server owns, and
+        until OIDC existed that secret was necessarily `TRMNL_UI_TOKEN_FILE`
+        — which meant an operator who configured *only* OIDC had nothing to
+        sign a session with, and `require_ui_session()` answered 503 to every
+        request even after a flawless code flow. So the key source
+        generalises: the UI secret when there is one, otherwise the OIDC
+        client secret.
+
+        Two consequences worth knowing, both acceptable and both documented
+        in the README:
+
+        * Rotating either file invalidates outstanding sessions, exactly as
+          rotating `TRMNL_UI_TOKEN_FILE` always has.
+        * On an OIDC-only deployment the IdP also holds the client secret, so
+          it could in principle derive the cookie key. It can already mint an
+          identity for anyone, so this is not an escalation — but it is why
+          `TRMNL_UI_TOKEN_FILE` remains the preferred source when both are
+          set.
+
+        None means *neither* login method is configured, which is the state
+        `require_ui_session()` refuses the whole control plane for. Invariant
+        preserved, with a two-input predicate instead of a one-input one.
+        """
+        return self.ui_token() or self.oidc_client_secret()
 
 
 _PANEL: 'Config | None' = None
