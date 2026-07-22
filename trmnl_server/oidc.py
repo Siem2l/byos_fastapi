@@ -463,6 +463,32 @@ def _discovery_problem(doc: object, issuer: str) -> str | None:
                 f"discovery document points {key!r} at plaintext http on a "
                 f"non-loopback host ({redact(doc.get(key))})"
             )
+    # RFC 8414 §2 / RFC 7636. This server always sends `code_challenge` with
+    # `code_challenge_method=S256`, but a provider that ignores PKCE entirely
+    # simply drops both and issues the code anyway — and the downgrade is
+    # invisible from here, because a successful login looks identical. So the
+    # advertisement is what gets checked, and its absence is a refusal rather
+    # than a shrug: every provider this feature targets (authentik, Keycloak,
+    # Authelia, Pocket ID, Google) publishes it, so a document without it is a
+    # provider that cannot be shown to be doing PKCE at all.
+    #
+    # `plain` is never selected even when offered. authentik advertises both,
+    # and `plain` puts the verifier in the authorization request, which is the
+    # exact leak PKCE exists to close.
+    methods = doc.get("code_challenge_methods_supported")
+    if not isinstance(methods, list) or not methods:
+        return (
+            "discovery document does not advertise "
+            "`code_challenge_methods_supported`, so PKCE support cannot be "
+            "confirmed and a silent downgrade to no PKCE would be undetectable"
+        )
+    if "S256" not in methods:
+        return (
+            "the provider does not advertise the PKCE `S256` challenge method "
+            f"(advertised: {redact(methods)}). This server will not fall back "
+            "to `plain`, which puts the verifier in the authorization request"
+        )
+
     advertised = normalise_issuer(str(doc.get("issuer") or ""))
     if advertised and advertised != issuer:
         # A warning, not a failure. authentik in *global* issuer mode
