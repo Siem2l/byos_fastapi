@@ -50,6 +50,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, Body, HTTPException, Request, Response
 
 from .. import config as config_module
+from .. import oidc as oidc_module
 from ..config import panel_config
 from ..credentials import secret_equal
 
@@ -164,6 +165,13 @@ def mint_session(secret: str, *, ttl: int = SESSION_TTL) -> str:
 
 
 def _valid_session_value(secret: str, value: str) -> bool:
+    # `_sign` does `payload.encode("ascii")`, and this payload is the first
+    # three fields of an attacker-supplied cookie — header values decode as
+    # latin-1, so a non-ASCII byte anywhere in them raised UnicodeEncodeError
+    # and 500 before any comparison happened. `secret_equal` already covers
+    # the signature field; this covers the other three.
+    if not value.isascii():
+        return False
     parts = value.split(".")
     if len(parts) != 4:
         return False
@@ -187,8 +195,13 @@ def _valid_session_value(secret: str, value: str) -> bool:
 
 
 def has_ui_session(request: Request) -> bool:
-    """True when the request carries a currently-valid session cookie."""
-    secret = panel_config().ui_token()
+    """True when the request carries a currently-valid session cookie.
+
+    `session_secret()`, not `ui_token()`: the cookie is the same whichever
+    login path minted it, and on an OIDC-only deployment there is no
+    `TRMNL_UI_TOKEN_FILE` to derive a key from. See `Config.session_secret`.
+    """
+    secret = panel_config().session_secret()
     if not secret:
         return False
     raw = request.cookies.get(COOKIE_NAME)
@@ -234,15 +247,17 @@ def _same_origin(request: Request) -> bool:
 def require_ui_session(request: Request) -> None:
     """Router-level dependency guarding the whole control plane.
 
-    Fail-closed: with no `TRMNL_UI_TOKEN_FILE` configured there is no way to
-    authenticate anyone, so the control plane is refused rather than opened.
-    A silently-evaporating guard is precisely the failure mode this design
-    exists to avoid.
+    Fail-closed: with *neither* login method configured there is no way to
+    authenticate anyone and no key to sign a session with, so the control
+    plane is refused rather than opened. A silently-evaporating guard is
+    precisely the failure mode this design exists to avoid. Adding OIDC
+    widened the predicate from one input to two; it did not weaken it.
     """
-    if not panel_config().ui_token():
+    if not panel_config().session_secret():
         logger.error(
-            "control-plane request refused: TRMNL_UI_TOKEN_FILE is not "
-            "configured, so no UI session can be minted or verified"
+            "control-plane request refused: neither TRMNL_UI_TOKEN_FILE nor "
+            "TRMNL_OIDC_CLIENT_SECRET_FILE is configured, so no UI session "
+            "can be minted or verified"
         )
         raise HTTPException(status_code=503, detail="ui token not configured")
     if not has_ui_session(request):
@@ -320,13 +335,25 @@ def destroy_session(request: Request) -> Response:
 
 
 @router.get("/auth/session")
-def session_state(request: Request) -> Dict[str, bool]:
-    """Whether this browser holds a session, so the UI can show a login form.
+def session_state(request: Request) -> Dict[str, Any]:
+    """Which login methods exist and whether this browser has used one.
 
-    Leaks nothing: `configured` is derivable by anyone who can POST here and
-    read the 503, and `authenticated` describes the caller's own cookie.
+    Leaks nothing an unauthenticated caller cannot already establish:
+    `configured` is derivable from the 503-vs-401 on `POST /auth/session`,
+    `oidc` from whether `/auth/oidc/login` redirects to a provider, and
+    `authenticated` describes the caller's own cookie. `oidc_provider` is a
+    display name the operator chose (or the issuer's hostname), which is
+    about to appear on a button on this very page.
+
+    The four fields are what lets the UI render the *right* thing rather
+    than a token form that can only ever 503 — the state a half-configured
+    box was previously stuck in.
     """
+    cfg = panel_config()
+    oidc_available = oidc_module.enabled(cfg)
     return {
-        "configured": bool(panel_config().ui_token()),
+        "configured": bool(cfg.ui_token()),
         "authenticated": has_ui_session(request),
+        "oidc": oidc_available,
+        "oidc_provider": oidc_module.provider_name(cfg) if oidc_available else None,
     }

@@ -364,6 +364,7 @@ def test_the_route_walk_sees_the_whole_app(client):
         "/api/display",        # panel
         "/rotation",           # control plane
         "/auth/session",       # session minting
+        "/auth/oidc/login",    # the second way to mint the same session
         "/generated/{path:path}",  # images
         "/",                   # pages
     } <= paths, sorted(paths)
@@ -608,6 +609,29 @@ def test_non_ascii_session_cookie_is_rejected_not_a_500(client):
     resp = client.get(
         "/rotation",
         headers={"Cookie": "trmnl_ui=v1.9999999999.aabbccdd.caf\xc3\xa9".encode("latin-1")},
+    )
+    assert resp.status_code == 401
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "v1.9999999999.aabbccdd.caf\xc3\xa9",   # non-ASCII signature
+        "v1.9999999999.caf\xc3\xa9.aabbccdd",   # non-ASCII nonce
+        "v1.caf\xc3\xa9.aabbccdd.eeff0011",     # non-ASCII expiry
+        "caf\xc3\xa9.9999999999.aabbccdd.ee",   # non-ASCII version
+    ],
+)
+def test_a_non_ascii_byte_anywhere_in_the_cookie_is_a_401(client, value):
+    """`_sign()` encodes as ASCII, and three of the four fields feed it.
+
+    Only the signature field was covered by `secret_equal`; a non-ASCII byte
+    in any of the other three reached `payload.encode("ascii")` and raised
+    UnicodeEncodeError — an unhandled 500 on a route anyone can reach.
+    """
+    resp = client.get(
+        "/rotation",
+        headers={"Cookie": f"trmnl_ui={value}".encode("latin-1")},
     )
     assert resp.status_code == 401
 

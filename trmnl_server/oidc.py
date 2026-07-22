@@ -303,3 +303,216 @@ def discovery(cfg: Config) -> dict[str, Any]:
         _discovery_failures.pop(issuer, None)
     logger.info("OIDC discovery loaded from %s", url)
     return doc
+
+
+# --- the code flow ---------------------------------------------------------
+
+
+def b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def b64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def authorization_url(
+    cfg: Config,
+    doc: dict[str, Any],
+    *,
+    state: str,
+    nonce: str,
+    code_challenge: str,
+    redirect_uri: str,
+) -> str:
+    """The URL the browser is 302'd to.
+
+    `redirect_uri` is passed in rather than read here so the caller proves it
+    came from `cfg.oidc_callback_url()` and not from the request.
+    """
+    endpoint = str(doc["authorization_endpoint"])
+    params = {
+        "response_type": "code",
+        "client_id": cfg.oidc_client_id,
+        "redirect_uri": redirect_uri,
+        "scope": cfg.oidc_scopes,
+        "state": state,
+        "nonce": nonce,
+        # PKCE on a confidential client too. It costs one hash and it is the
+        # only thing that helps if an authorization code leaks through a
+        # referrer, a proxy log or a shared browser.
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    separator = "&" if urlsplit(endpoint).query else "?"
+    return endpoint + separator + urlencode(params)
+
+
+def code_challenge_for(verifier: str) -> str:
+    import hashlib
+
+    return b64url(hashlib.sha256(verifier.encode("ascii")).digest())
+
+
+def _token_auth(
+    doc: dict[str, Any], client_id: str, client_secret: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    """`(extra_headers, extra_form_fields)` for authenticating to the token endpoint.
+
+    Read from discovery rather than hardcoded: Authelia defaults to
+    `client_secret_basic` and *enforces* the registered method, so a hardcoded
+    `client_secret_post` fails there. The OIDC spec's default when the
+    provider advertises nothing is `client_secret_basic`.
+    """
+    methods = doc.get("token_endpoint_auth_methods_supported")
+    if isinstance(methods, list) and methods:
+        if "client_secret_basic" in methods:
+            chosen = "client_secret_basic"
+        elif "client_secret_post" in methods:
+            chosen = "client_secret_post"
+        else:
+            raise OidcError(
+                "oidc_provider",
+                "the provider supports none of the client authentication "
+                f"methods this server implements (advertised: {methods!r}; "
+                "supported: client_secret_basic, client_secret_post)",
+            )
+    else:
+        chosen = "client_secret_basic"
+
+    if chosen == "client_secret_post":
+        return {}, {"client_id": client_id, "client_secret": client_secret}
+    # RFC 6749 §2.3.1: both halves are form-urlencoded *before* base64.
+    pair = f"{quote(client_id, safe='')}:{quote(client_secret, safe='')}"
+    encoded = base64.b64encode(pair.encode("utf-8")).decode("ascii")
+    return {"Authorization": f"Basic {encoded}"}, {"client_id": client_id}
+
+
+def exchange_code(
+    cfg: Config,
+    doc: dict[str, Any],
+    *,
+    code: str,
+    code_verifier: str,
+    redirect_uri: str,
+) -> dict[str, Any]:
+    """Swap the authorization code for tokens, server-side."""
+    secret = cfg.oidc_client_secret()
+    if not secret:
+        raise OidcError("oidc_disabled", "the OIDC client secret is unavailable")
+    headers, extra = _token_auth(doc, cfg.oidc_client_id, secret)
+    form = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "code_verifier": code_verifier,
+        **extra,
+    }
+    headers = {"Accept": "application/json", **headers}
+    try:
+        with _http_client() as client:
+            response = client.post(
+                str(doc["token_endpoint"]), data=form, headers=headers
+            )
+    except httpx.HTTPError as exc:
+        raise OidcError(
+            "oidc_provider", f"token endpoint unreachable: {exc}"
+        ) from exc
+    if response.status_code != 200:
+        raise OidcError(
+            "oidc_provider",
+            f"token endpoint returned HTTP {response.status_code}: "
+            f"{response.text[:200]!r}",
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise OidcError(
+            "oidc_provider", "token endpoint returned a non-JSON body"
+        ) from exc
+    if not isinstance(payload, dict) or not payload.get("access_token"):
+        raise OidcError(
+            "oidc_provider", "token response carried no access_token"
+        )
+    return payload
+
+
+def decode_jwt_claims(token: str) -> dict[str, Any]:
+    """The claim set of a JWT, *without* verifying its signature.
+
+    Legitimate only for a token received directly from the token endpoint
+    over TLS with client authentication — see the module docstring and OIDC
+    Core §3.1.3.7 item 6. Never call this on anything a browser handed us.
+    """
+    parts = token.split(".")
+    if len(parts) < 2:
+        raise OidcError("oidc_provider", "id_token is not a JWT")
+    try:
+        claims = json.loads(b64url_decode(parts[1]))
+    except (ValueError, binascii.Error) as exc:
+        raise OidcError(
+            "oidc_provider", f"id_token payload is not decodable JSON: {exc}"
+        ) from exc
+    if not isinstance(claims, dict):
+        raise OidcError("oidc_provider", "id_token payload is not a JSON object")
+    return claims
+
+
+def fetch_userinfo(doc: dict[str, Any], access_token: str) -> dict[str, Any]:
+    """The authenticated identity call. JSON only, on purpose.
+
+    Keycloak (`user.info.response.signature.alg`) and Authelia
+    (`userinfo_signed_response_alg`) can both return `application/jwt`
+    instead. Accepting that would mean parsing a *signed* assertion and
+    ignoring the signature — which is not what §3.1.3.7 item 6 licenses,
+    because this response did not come back from the token endpoint. So it is
+    refused with a code the UI can explain, and the README tells operators to
+    leave the signing algorithm at `none`.
+    """
+    try:
+        with _http_client() as client:
+            response = client.get(
+                str(doc["userinfo_endpoint"]),
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/json",
+                },
+            )
+    except httpx.HTTPError as exc:
+        raise OidcError(
+            "oidc_provider", f"userinfo endpoint unreachable: {exc}"
+        ) from exc
+    if response.status_code != 200:
+        raise OidcError(
+            "oidc_provider",
+            f"userinfo endpoint returned HTTP {response.status_code}",
+        )
+    content_type = (response.headers.get("content-type") or "").split(";")[0].strip()
+    if content_type == "application/jwt":
+        raise OidcError(
+            "oidc_userinfo_jwt",
+            "userinfo returned application/jwt. This server has no JWT "
+            "signature verification (and no crypto dependency), so it will "
+            "not consume a signed assertion it cannot check. Set the "
+            "provider's userinfo response signing algorithm to 'none'.",
+        )
+    try:
+        claims = response.json()
+    except ValueError as exc:
+        raise OidcError(
+            "oidc_provider", "userinfo returned a non-JSON body"
+        ) from exc
+    if not isinstance(claims, dict):
+        raise OidcError("oidc_provider", "userinfo did not return a JSON object")
+    return claims
+
+
+def subject_label(userinfo: dict[str, Any], id_claims: dict[str, Any]) -> str:
+    """A short human handle for the log line. Never a credential."""
+    for source in (userinfo, id_claims):
+        for key in ("preferred_username", "email", "name", "sub"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return "<unknown>"
