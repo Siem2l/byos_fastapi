@@ -397,6 +397,14 @@ class Config:
         'TRMNL_STATE_DIR', '/var/lib/trmnl'))
     garmin_db_dir: str = field(default_factory=lambda: environ.get(
         'TRMNL_GARMIN_DB_DIR', '/mnt/storage/garmin/DBs'))
+    # Base URL of the Prometheus HTTP API, e.g. http://127.0.0.1:8001.
+    # Empty is the default and means the feature is off: the `homelab`
+    # and `stats` screens have nothing to ask and render a notice saying
+    # so, while `readiness` is unaffected. No default host is guessed —
+    # a screen silently querying localhost on a deployment that never
+    # configured one would be a surprising outbound connection.
+    prometheus_url: str = field(default_factory=lambda: environ.get(
+        'TRMNL_PROMETHEUS_URL', '').rstrip('/'))
     # Playlist: screens are served round-robin in this order.
     playlist: list[str] = field(default_factory=lambda: _env_list(
         'TRMNL_PLAYLIST', ['readiness']))
