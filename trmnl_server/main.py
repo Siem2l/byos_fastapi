@@ -22,6 +22,7 @@ from .routes import (
     api_router,
     auth_router,
     image_router,
+    oidc_router,
     page_router,
     panel_router,
 )
@@ -258,6 +259,11 @@ def create_app(cfg: Config) -> FastAPI:
     app.include_router(panel_router)
     app.include_router(api_router)
     app.include_router(auth_router)
+    # Immediately after auth_router and before image_router: `/auth/oidc/*`
+    # is prefix-less like every other router here, so it cannot be shadowed
+    # by image_router's `/generated/{path:path}` catch-all or by
+    # page_router's `/`.
+    app.include_router(oidc_router)
     app.include_router(image_router)
     app.include_router(page_router)
     _mount_static(app)

@@ -95,10 +95,14 @@ def _reset_process_state() -> None:
     auth_module._mint_failures.clear()
     auth_module._mint_global_failures.clear()
 
-    # Same argument for the discovery cache: a document fetched by one test's
-    # fake IdP would otherwise still be cached for the next test's, which
-    # would pass while proving nothing.
+    # Same argument for the discovery cache and the single-use state ledger:
+    # a document fetched by one test's fake IdP would otherwise still be
+    # cached for the next test's, and a redeemed state would still be
+    # redeemed — either of which would let a test pass while proving nothing.
+    from trmnl_server.routes import oidc as oidc_routes
+
     oidc_module.reset_caches()
+    oidc_routes.reset_state_store()
 
 
 @pytest.fixture()
@@ -166,6 +170,8 @@ class FakeIdp:
         discovery_status: int = 200,
         discovery_document: dict[str, Any] | None = None,
         userinfo_claims: dict[str, Any] | None = None,
+        nonce_override: str | None = None,
+        omit_id_token: bool = False,
     ) -> None:
         self.issuer = issuer
         self.advertised_issuer = advertised_issuer
@@ -178,6 +184,8 @@ class FakeIdp:
         self.discovery_status = discovery_status
         self.discovery_document = discovery_document
         self.userinfo_claims = userinfo_claims
+        self.nonce_override = nonce_override
+        self.omit_id_token = omit_id_token
         self.client_secret = OIDC_CLIENT_SECRET
 
         # Observability for assertions.
@@ -232,6 +240,8 @@ class FakeIdp:
     # -- the server's half, over real HTTP --------------------------------
 
     def _claims(self, sub: str, *, nonce: str | None) -> dict[str, Any]:
+        if self.nonce_override is not None:
+            nonce = self.nonce_override
         return {
             "iss": self.issuer,
             "sub": sub,
@@ -340,12 +350,14 @@ class FakeIdp:
                 claims[idp.groups_claim] = list(idp.groups)
             access_token = "at-" + secrets.token_hex(8)
             idp._access_tokens[access_token] = {"sub": record["sub"]}
-            return JSONResponse({
+            body: dict[str, Any] = {
                 "access_token": access_token,
                 "token_type": "Bearer",
                 "expires_in": 300,
-                "id_token": idp._jwt(claims),
-            })
+            }
+            if not idp.omit_id_token:
+                body["id_token"] = idp._jwt(claims)
+            return JSONResponse(body)
 
         @app.get("/userinfo")
         def userinfo(authorization: str | None = Header(default=None)) -> Response:
