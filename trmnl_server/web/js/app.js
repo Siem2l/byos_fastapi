@@ -125,6 +125,53 @@
     return res.status === 204;
   }
 
+  // The fixed vocabulary routes/oidc.py is allowed to put in ?login_error=.
+  // Codes only, mapped to strings that live here: nothing the identity
+  // provider said is ever reflected into the DOM, and an unrecognised code
+  // falls through to the generic message rather than being rendered.
+  //
+  // The wording matters more than it looks. "Your account is not in an
+  // allowed group" and "the provider sent no groups claim" are the same
+  // symptom with completely different fixes, and collapsing them into
+  // "login failed" is what makes a misconfigured IdP take an afternoon.
+  const LOGIN_ERRORS = {
+    oidc_disabled: 'Single sign-on is not configured on this server.',
+    oidc_state:
+      'That sign-in attempt expired, or it did not start in this browser. Try again.',
+    oidc_provider:
+      'The identity provider could not be reached, or it refused the sign-in.',
+    oidc_nonce:
+      'The provider\u2019s response did not belong to this sign-in attempt.',
+    oidc_group: 'Your account is not in an allowed group.',
+    oidc_group_claim_missing:
+      'The identity provider returned no groups claim. Check that the scope granting group membership is requested, and that the claim is included in the userinfo response.',
+    oidc_userinfo_jwt:
+      'The identity provider returned a signed userinfo response, which this server will not consume without verifying. Set its userinfo signing algorithm to \u201cnone\u201d.',
+    oidc_throttled:
+      'Too many failed sign-in attempts. Wait a few minutes and try again.'
+  };
+
+  // Read the code once and strip it from the URL, so a reload or a shared
+  // link does not resurrect a failure that has already been reported.
+  function takeLoginError() {
+    if (typeof window === 'undefined' || !window.location) {
+      return '';
+    }
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('login_error');
+    if (!code) {
+      return '';
+    }
+    params.delete('login_error');
+    const query = params.toString();
+    if (window.history && window.history.replaceState) {
+      window.history.replaceState(
+        {}, '', window.location.pathname + (query ? `?${query}` : '')
+      );
+    }
+    return LOGIN_ERRORS[code] || 'Sign-in failed.';
+  }
+
   function withCacheBuster(url, seed, fallbackToNow = true) {
     if (!url) {
       return url;
@@ -310,6 +357,13 @@
     const [logsError, setLogsError] = useState(null);
     const [rotationFeedback, setRotationFeedback] = useState('');
     const [authRequired, setAuthRequired] = useState(false);
+    // What GET /auth/session reports about the *server*, not this browser:
+    // which login methods exist, so the overlay renders the right thing
+    // instead of a token form that can only ever 503.
+    const [authMethods, setAuthMethods] = useState({
+      configured: true, oidc: false, oidcProvider: null
+    });
+    const [loginError, setLoginError] = useState('');
     const [theme, setTheme] = useState(() => {
       if (typeof window === 'undefined') {
         return 'light';
@@ -456,18 +510,46 @@
     }, []);
 
     // Ask up front rather than waiting for the first control-plane 401, so a
-    // cold load shows the unlock form instead of an empty dashboard.
+    // cold load shows the right login form instead of an empty dashboard.
+    // The response also says which login methods the server has, which is
+    // what stops a box with only OIDC configured from being offered a token
+    // field that can only ever 503.
     useEffect(() => {
       let cancelled = false;
-      fetch('/auth/session', { headers: { Accept: 'application/json' } })
-        .then((res) => (res.ok ? res.json() : null))
-        .then((data) => {
-          if (!cancelled && data && !data.authenticated) {
-            setAuthRequired(true);
-          }
-        })
-        .catch(() => {});
-      const onAuthRequired = () => setAuthRequired(true);
+      const probe = () =>
+        fetch('/auth/session', { headers: { Accept: 'application/json' } })
+          .then((res) => (res.ok ? res.json() : null))
+          .then((data) => {
+            if (cancelled || !data) {
+              return;
+            }
+            setAuthMethods({
+              configured: Boolean(data.configured),
+              oidc: Boolean(data.oidc),
+              oidcProvider: data.oidc_provider || null
+            });
+            if (!data.authenticated) {
+              setAuthRequired(true);
+            }
+          })
+          .catch(() => {});
+
+      // A failed SSO round trip comes back as /?login_error=<code>. Surface
+      // it before the probe answers, so the reason is on screen immediately.
+      const failure = takeLoginError();
+      if (failure) {
+        setLoginError(failure);
+        setAuthRequired(true);
+      }
+      probe();
+
+      // Re-probe on a mid-session expiry too: the server's configuration may
+      // have changed under a long-lived tab, and the overlay is about to be
+      // rendered from it.
+      const onAuthRequired = () => {
+        setAuthRequired(true);
+        probe();
+      };
       window.addEventListener(AUTH_EVENT, onAuthRequired);
       return () => {
         cancelled = true;
@@ -479,6 +561,7 @@
       const ok = await submitUiToken(token);
       if (ok) {
         setAuthRequired(false);
+        setLoginError('');
       }
       return ok;
     }, []);
@@ -843,7 +926,13 @@
 
     return html`
       <div class="app-shell">
-        ${authRequired ? html`<${LoginOverlay} onUnlock=${handleUnlock} />` : null}
+        ${authRequired
+          ? html`<${LoginOverlay}
+              methods=${authMethods}
+              serverError=${loginError}
+              onUnlock=${handleUnlock}
+            />`
+          : null}
         <${Menu} activeTab=${activeTab} setActiveTab=${setActiveTab} />
         <${Topbar}
           status=${status}
@@ -1736,10 +1825,20 @@
     return html`<div class="playlist-grid">${items}</div>`;
   }
 
-  function LoginOverlay({ onUnlock }) {
+  // Renders whichever login methods the server actually has: the secret
+  // form when TRMNL_UI_TOKEN_FILE is configured, a "Sign in with ..." button
+  // when TRMNL_OIDC_ISSUER is, both when both are, and an explanation when
+  // neither is — which used to render a token field whose only possible
+  // outcome was a 503.
+  function LoginOverlay({ methods, serverError, onUnlock }) {
     const [token, setToken] = useState('');
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState('');
+
+    const config = methods || {};
+    const hasSecret = config.configured !== false;
+    const hasOidc = Boolean(config.oidc);
+    const providerName = config.oidcProvider || 'single sign-on';
 
     const submit = async (event) => {
       event.preventDefault();
@@ -1764,24 +1863,56 @@
 
     return html`
       <div class="login-overlay">
-        <form class="login-card" onSubmit=${submit}>
+        <div class="login-card">
           <h2>Unlock the dashboard</h2>
-          <p>
-            This server keeps its own session for the control plane, separate
-            from the panel's access token. Paste the UI token to continue.
-          </p>
-          <input
-            type="password"
-            autocomplete="off"
-            placeholder="UI token"
-            value=${token}
-            onInput=${(e) => setToken(e.target.value)}
-          />
-          ${error ? html`<div class="login-error">${error}</div>` : null}
-          <button type="submit" disabled=${busy || !token.trim()}>
-            ${busy ? 'Checking…' : 'Unlock'}
-          </button>
-        </form>
+          ${serverError ? html`<div class="login-error">${serverError}</div>` : null}
+          ${!hasSecret && !hasOidc
+            ? html`<p>
+                This server has no login method configured, so the control
+                plane will refuse every request. Set
+                <code>TRMNL_UI_TOKEN_FILE</code> to a file holding a secret,
+                or configure <code>TRMNL_OIDC_ISSUER</code>.
+              </p>`
+            : null}
+          ${/* A plain link, not a fetch: the code flow is a top-level
+                navigation, and /auth/oidc/login takes no parameters at all,
+                so there is nothing here that could point it elsewhere. */
+            hasOidc
+            ? html`
+                <p>
+                  Sign in with your identity provider. The panel's own
+                  endpoints are unaffected either way — the device never
+                  sees this.
+                </p>
+                <a class="login-sso" href="/auth/oidc/login" rel="nofollow">
+                  Sign in with ${providerName}
+                </a>
+              `
+            : null}
+          ${hasOidc && hasSecret ? html`<div class="login-divider">or</div>` : null}
+          ${hasSecret
+            ? html`
+                <form class="login-form" onSubmit=${submit}>
+                  <p>
+                    This server keeps its own session for the control plane,
+                    separate from the panel's access token. Paste the UI token
+                    to continue.
+                  </p>
+                  <input
+                    type="password"
+                    autocomplete="off"
+                    placeholder="UI token"
+                    value=${token}
+                    onInput=${(e) => setToken(e.target.value)}
+                  />
+                  ${error ? html`<div class="login-error">${error}</div>` : null}
+                  <button type="submit" disabled=${busy || !token.trim()}>
+                    ${busy ? 'Checking…' : 'Unlock'}
+                  </button>
+                </form>
+              `
+            : null}
+        </div>
       </div>
     `;
   }
