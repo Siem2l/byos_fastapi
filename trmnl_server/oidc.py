@@ -39,6 +39,7 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from ipaddress import ip_address
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
 
@@ -224,6 +225,44 @@ def _is_absolute_http_url(value: object) -> bool:
     return parts.scheme in ("http", "https") and bool(parts.netloc)
 
 
+def _is_loopback(host: str) -> bool:
+    """True for 127.0.0.0/8, ::1 and the `localhost` names RFC 6761 reserves."""
+    host = (host or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def is_secure_url(value: object) -> bool:
+    """https anywhere, or http only to loopback.
+
+    The reason this exists at all is that the whole zero-dependency design
+    rests on OIDC Core §3.1.3.7 item 6, which permits skipping the ID token
+    signature check *only* because the token arrived "directly from the Token
+    Endpoint ... over a TLS-protected channel". Take the TLS away and the
+    premise is gone: an unsigned-in-practice assertion over plaintext is
+    whatever the network says it is, and so is the `client_secret` sent to
+    fetch it. Accepting an `http://` issuer therefore did not weaken one
+    check, it invalidated the argument for not having one.
+
+    Loopback is the exception, and only loopback: `http://127.0.0.1:8105` has
+    no network to be on, and a developer running the server and the IdP on one
+    machine is the case this feature has to stay usable for. It is documented
+    in the README as the only plaintext arrangement that works.
+    """
+    if not _is_absolute_http_url(value):
+        return False
+    parts = urlsplit(str(value))
+    if parts.scheme == "https":
+        return True
+    return _is_loopback(parts.hostname or "")
+
+
 def is_configured(cfg: Config) -> bool:
     """The operator asked for OIDC, whether or not it actually works."""
     return bool(cfg.oidc_issuer)
@@ -244,6 +283,15 @@ def configuration_problem(cfg: Config) -> str | None:
             f"TRMNL_OIDC_ISSUER {cfg.oidc_issuer!r} is not an absolute "
             "http(s) URL"
         )
+    if not is_secure_url(cfg.oidc_issuer):
+        return (
+            f"TRMNL_OIDC_ISSUER {cfg.oidc_issuer!r} is plaintext http to a "
+            "non-loopback host. This server does not verify the ID token "
+            "signature, which OIDC Core 3.1.3.7 item 6 only permits over a "
+            "TLS-protected channel — so without https there is nothing left "
+            "authenticating the provider. Use https, or point the issuer at "
+            "loopback for local development."
+        )
     if not cfg.oidc_client_id:
         return "TRMNL_OIDC_CLIENT_ID is not set"
     if not cfg.oidc_client_secret_file:
@@ -263,6 +311,13 @@ def configuration_problem(cfg: Config) -> str | None:
             "derive its redirect URI from and to allowlist it against"
         )
     redirect = cfg.oidc_callback_url()
+    if not is_secure_url(redirect):
+        return (
+            f"the OIDC redirect URI {redirect!r} is plaintext http to a "
+            "non-loopback host. The authorization code comes back on it, so "
+            "it must be https unless this is a loopback development setup. "
+            "Set TRMNL_BASE_URL (or TRMNL_OIDC_REDIRECT_URL) to an https URL."
+        )
     if not redirect.startswith(cfg.base_url.rstrip("/") + "/"):
         return (
             f"TRMNL_OIDC_REDIRECT_URL {redirect!r} is not under TRMNL_BASE_URL "
@@ -324,6 +379,16 @@ def _discovery_problem(doc: object, issuer: str) -> str | None:
     for key in ("authorization_endpoint", "token_endpoint", "userinfo_endpoint"):
         if not _is_absolute_http_url(doc.get(key)):
             return f"discovery document has no usable {key!r}"
+        if not is_secure_url(doc.get(key)):
+            # Discovery is fetched from the issuer, so this is the issuer
+            # moving the flow to plaintext — by misconfiguration or because
+            # someone rewrote the document in transit. Either way the token
+            # endpoint is where the client_secret goes and the ID token comes
+            # back, and neither belongs on a cleartext hop.
+            return (
+                f"discovery document points {key!r} at plaintext http on a "
+                f"non-loopback host ({redact(doc.get(key))})"
+            )
     advertised = normalise_issuer(str(doc.get("issuer") or ""))
     if advertised and advertised != issuer:
         # A warning, not a failure. authentik in *global* issuer mode
