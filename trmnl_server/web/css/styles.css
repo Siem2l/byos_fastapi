@@ -151,6 +151,29 @@ body {
 		.fa-trash::before                { content: "\2715"; }  /* ✕ multiplication x */
 		.fa-moon::before                 { content: "\263E"; }  /* ☾ last quarter moon */
 		.fa-sun::before                  { content: "\263C"; }  /* ☼ white sun with rays */
+
+		/* Panel-health gauges. Native <meter> coloured by its low/high/optimum
+		 * thresholds — battery_state / wifi_signal_strength both run 0-100 with
+		 * "more is better". Fixed fill colours (not theme vars) so the
+		 * red/amber/green reading stays legible on either surface. */
+		.health-meter { display: flex; align-items: center; gap: 6px; }
+		.health-meter > .fas { color: var(--color-muted); flex: 0 0 auto; }
+		.health-meter-label { font-size: 0.85rem; color: var(--color-muted); white-space: nowrap; }
+		.health-meter-unknown .health-meter-label { font-style: italic; opacity: 0.7; }
+		.health-meter-bar { width: 68px; height: 9px; flex: 0 0 auto; border: none; border-radius: 5px; background: var(--color-menu-active); }
+		/* Chrome / Safari: track + per-region fill. */
+		.health-meter-bar::-webkit-meter-bar { background: var(--color-menu-active); border-radius: 5px; }
+		.health-meter-bar::-webkit-meter-optimum-value { background: #2fae66; border-radius: 5px; }
+		.health-meter-bar::-webkit-meter-suboptimum-value { background: #e0a92f; border-radius: 5px; }
+		.health-meter-bar::-webkit-meter-even-less-good-value { background: #e0574f; border-radius: 5px; }
+		/* Firefox colours the bar itself by region automatically. */
+		.health-meter-bar::-moz-meter-bar { border-radius: 5px; }
+
+		.device-stats-meters { align-items: center; }
+		/* A stale last-seen is the same signal the TrmnlPanelOffline alert fires
+		 * on — surface it, don't let it read as a neutral timestamp. */
+		.device-card-lastseen.stale, .device-stats-lastseen.stale { color: #e0574f; font-weight: 600; }
+
 		.topbar { position: fixed; top: 0; left: 0; right: 0; height: 56px; background-color: var(--color-topbar-bg); color: var(--color-topbar-text); display: flex; align-items: center; justify-content: space-between; padding: 0 20px; box-sizing: border-box; z-index: 1000; gap: 20px; border-bottom: 1px solid var(--color-border); box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08); }
 		.topbar-left { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
 		.topbar-item { display: flex; align-items: center; }

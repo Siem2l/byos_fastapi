@@ -1156,6 +1156,75 @@
     `;
   }
 
+  // Battery / signal as a native <meter>. The gauge reads at a glance and the
+  // browser colours it from the low/high/optimum thresholds — no JS, no canvas,
+  // correct in light and dark. `optimum` sits at the top so "more is better":
+  // low values render red, mid amber, high green.
+  //
+  // percent === null means the panel never reported this, which must look like
+  // "unknown", not "0%" — an empty gauge would imply a flat battery. charging
+  // (battery_state === 255, i.e. > 4.6V) pins the gauge full with a label.
+  function HealthMeter({ percent, charging = false, suffix = '', icon }) {
+    if (charging) {
+      return html`
+        <div class="health-meter" title="Charging">
+          <i class=${`fas ${icon}`}></i>
+          <meter class="health-meter-bar" min="0" max="100" low="25" high="75" optimum="95" value="100"></meter>
+          <span class="health-meter-label">Charging</span>
+        </div>
+      `;
+    }
+    if (percent == null || !Number.isFinite(Number(percent))) {
+      return html`
+        <div class="health-meter health-meter-unknown">
+          <i class=${`fas ${icon}`}></i>
+          <span class="health-meter-label">N/A</span>
+        </div>
+      `;
+    }
+    const value = Math.max(0, Math.min(100, Number(percent)));
+    const label = suffix ? `${Math.round(value)}% · ${suffix}` : `${Math.round(value)}%`;
+    return html`
+      <div class="health-meter" title=${label}>
+        <i class=${`fas ${icon}`}></i>
+        <meter class="health-meter-bar" min="0" max="100" low="25" high="75" optimum="95" value=${value}></meter>
+        <span class="health-meter-label">${label}</span>
+      </div>
+    `;
+  }
+
+  // Human "time since". Returns staleness too: past the panel's ~30-min refresh
+  // by a wide margin (the 1h TrmnlPanelOffline threshold) the age is flagged so
+  // the card can show it as a warning rather than a neutral timestamp.
+  function formatRelativeAge(value) {
+    if (value == null || value === '') {
+      return { text: 'never', stale: true, missing: true };
+    }
+    let ms;
+    if (typeof value === 'number') {
+      ms = value * 1000;
+    } else {
+      const parsed = new Date(value).getTime();
+      ms = Number.isNaN(parsed) ? NaN : parsed;
+    }
+    if (!Number.isFinite(ms)) {
+      return { text: 'never', stale: true, missing: true };
+    }
+    const seconds = Math.max(0, Math.round((Date.now() - ms) / 1000));
+    const stale = seconds > 3600;
+    let text;
+    if (seconds < 60) {
+      text = 'just now';
+    } else if (seconds < 3600) {
+      text = `${Math.floor(seconds / 60)}m ago`;
+    } else if (seconds < 86400) {
+      text = `${Math.floor(seconds / 3600)}h ago`;
+    } else {
+      text = `${Math.floor(seconds / 86400)}d ago`;
+    }
+    return { text, stale, missing: false };
+  }
+
   function DeviceGrid({ devices, selectedDeviceId, onSelectDevice }) {
     const normalizedDevices = normalizeDevicesList(devices || []);
     if (!normalizedDevices.length) {
@@ -1168,13 +1237,17 @@
           const metrics = device.metrics || {};
           const profile = device.profile || {};
           const voltageValue = Number(metrics.battery_voltage);
-          const wifiValue = metrics.rssi;
-          const voltage = Number.isFinite(voltageValue) ? `${voltageValue.toFixed(2)} V` : 'N/A';
-          const wifi = Number.isFinite(wifiValue) ? `${wifiValue} dBm` : 'N/A';
+          const wifiValue = Number(metrics.rssi);
+          const batteryState = Number(metrics.battery_state);
+          const charging = batteryState === 255;
+          const batteryPercent = charging || !Number.isFinite(batteryState) ? null : batteryState;
+          const voltageSuffix = Number.isFinite(voltageValue) && voltageValue > 0 ? `${voltageValue.toFixed(2)}V` : '';
+          const wifiPercent = metrics.wifi_signal_strength;
+          const wifiSuffix = Number.isFinite(wifiValue) && wifiValue < 0 ? `${wifiValue} dBm` : '';
           const rawRefresh = metrics.refresh_rate ?? profile.refresh_interval;
           const refreshNumber = Number(rawRefresh);
           const refreshText = Number.isFinite(refreshNumber) && refreshNumber > 0 ? `${refreshNumber}s` : 'N/A';
-          const lastContact = formatDisplayTimestamp(metrics.last_contact || profile.last_seen);
+          const lastSeen = formatRelativeAge(metrics.last_contact || profile.last_seen);
           const previewUrl = device.state?.current_preview_url;
           const previewSeed = device.state?.current_preview_token || device.state?.current_entry_hash;
           const previewSrc = withCacheBuster(previewUrl, previewSeed, false);
@@ -1203,14 +1276,16 @@
                 <span class="device-card-id">${device.device_id}</span>
               </div>
               <div class="device-card-body">
-                <div class="device-card-metric"><i class="fas fa-battery-half"></i>${voltage}</div>
-                <div class="device-card-metric"><i class="fas fa-wifi"></i>${wifi}</div>
+                <${HealthMeter} icon="fa-battery-half" percent=${batteryPercent} charging=${charging} suffix=${voltageSuffix} />
+                <${HealthMeter} icon="fa-wifi" percent=${wifiPercent} suffix=${wifiSuffix} />
                 <div class="device-card-metric"><i class="fas fa-sync-alt"></i>${refreshText}</div>
               </div>
               <div class="device-card-footer">
                 <span class="device-card-playlist">Playlist: ${playlistLabel}</span>
                 <span class="device-card-plugin">Now showing: ${pluginLabel}</span>
-                <span>Last contact: ${lastContact}</span>
+                <span class=${`device-card-lastseen${lastSeen.stale ? ' stale' : ''}`}>
+                  Last seen: ${lastSeen.text}
+                </span>
               </div>
             </button>
           `;
@@ -1296,10 +1371,13 @@
     const metrics = activeDevice?.metrics || {};
     const profile = activeDevice?.profile || {};
     const batteryValue = Number(metrics.battery_voltage);
-    const batteryText = Number.isFinite(batteryValue) ? `${batteryValue.toFixed(2)} V` : 'N/A';
+    const detailBatteryState = Number(metrics.battery_state);
+    const detailCharging = detailBatteryState === 255;
+    const detailBatteryPercent = detailCharging || !Number.isFinite(detailBatteryState) ? null : detailBatteryState;
+    const detailVoltageSuffix = Number.isFinite(batteryValue) && batteryValue > 0 ? `${batteryValue.toFixed(2)}V` : '';
     const wifiValue = Number(metrics.rssi);
-    const wifiText = Number.isFinite(wifiValue) ? `${wifiValue} dBm` : 'N/A';
-    const lastSeenText = formatDisplayTimestamp(metrics.last_contact || profile.last_seen);
+    const detailWifiSuffix = Number.isFinite(wifiValue) && wifiValue < 0 ? `${wifiValue} dBm` : '';
+    const detailLastSeen = formatRelativeAge(metrics.last_contact || profile.last_seen);
 
     if (!hasDevices) {
       return html`
@@ -1332,10 +1410,12 @@
                       <h2>Device settings</h2>
                       <span class="section-subtitle">ID: ${activeDevice.device_id}</span>
                     </div>
-                    <div class="device-stats">
-                      <span><i class="fas fa-bolt"></i>${batteryText}</span>
-                      <span><i class="fas fa-wifi"></i>${wifiText}</span>
-                      <span><i class="fas fa-clock"></i>${lastSeenText}</span>
+                    <div class="device-stats device-stats-meters">
+                      <${HealthMeter} icon="fa-bolt" percent=${detailBatteryPercent} charging=${detailCharging} suffix=${detailVoltageSuffix} />
+                      <${HealthMeter} icon="fa-wifi" percent=${metrics.wifi_signal_strength} suffix=${detailWifiSuffix} />
+                      <span class=${`device-stats-lastseen${detailLastSeen.stale ? ' stale' : ''}`}>
+                        <i class="fas fa-clock"></i>Last seen: ${detailLastSeen.text}
+                      </span>
                     </div>
                     <form class="device-form" onSubmit=${handleSubmit}>
                       <label>
