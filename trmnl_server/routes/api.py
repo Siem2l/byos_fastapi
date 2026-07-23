@@ -102,6 +102,17 @@ def _screen_title_for_plugin(plugin_name: Optional[str]) -> Optional[str]:
         return None
 
 
+def _wifi_percent(rssi: Any) -> Optional[int]:
+    """RSSI dBm as a 0-100 gauge value, or None when there is no reading.
+
+    A real RSSI is a negative dBm; 0, None or a positive value all mean the
+    panel has not reported signal, and must not render as full bars.
+    """
+    if not isinstance(rssi, (int, float)) or rssi >= 0:
+        return None
+    return utils.get_wifi_signal_strength(int(rssi))
+
+
 def _next_refresh_at(last_contact: Any, refresh_interval: Optional[int]) -> Optional[str]:
     """When the panel is next due to poll, or None if it never has.
 
@@ -139,6 +150,11 @@ def _serialize_device_payload(device_id: str) -> Dict[str, Any]:
             'battery_voltage': metrics.get('battery_voltage'),
             'battery_state': utils.get_battery_state(metrics.get('battery_voltage')),
             'rssi': metrics.get('rssi'),
+            # 0-100 for a gauge, mirroring battery_state. None rather than a
+            # misleading 100% when there is no reading: a real RSSI is always a
+            # negative dBm, so 0/None/positive means "the panel never reported",
+            # and get_wifi_signal_strength(0) would otherwise read as full bars.
+            'wifi_signal_strength': _wifi_percent(metrics.get('rssi')),
             'last_contact': utils.to_iso_timestamp(metrics.get('last_contact'))
         },
         'profile': {
