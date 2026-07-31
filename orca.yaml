@@ -9,7 +9,16 @@ scripts:
   # package. pytest is only declared in requirements.txt, not in
   # pyproject.toml, so `uv sync` alone leaves `make test` unable to run —
   # the second command adds it.
-  setup: uv sync && uv pip install -r requirements.txt
+  # Orca runs this as bash with `set -e`, cwd = the new worktree, and exports
+  # $ORCA_ROOT_PATH (primary checkout), $ORCA_WORKTREE_PATH, $ORCA_WORKSPACE_NAME.
+  setup: |
+    uv sync
+    uv pip install -r requirements.txt
+    # config.yaml is gitignored, so a worktree starts unconfigured. `if` rather
+    # than `&&`: under `set -e` a false test as the last statement would abort.
+    if [ -f "$ORCA_ROOT_PATH/config.yaml" ]; then
+      cp "$ORCA_ROOT_PATH/config.yaml" config.yaml
+    fi
 
 # Tab colours are gruvbox, matching the apis-mellifera hive theme that paints
 # the rest of this setup (vars/theme.nix there). #fe8019 is the shared
