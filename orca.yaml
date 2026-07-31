@@ -1,0 +1,35 @@
+# Orca project defaults for byos_fastapi.
+# Supported keys: scripts.{setup,archive}, issueCommand, defaultTabs,
+# environmentRecipes, worktree.sharedDirectories.
+#
+# The repo icon is not configured here — Orca auto-detects ./favicon.png.
+
+scripts:
+  # `uv sync` installs the locked runtime deps (uv.lock) plus the editable
+  # package. pytest is only declared in requirements.txt, not in
+  # pyproject.toml, so `uv sync` alone leaves `make test` unable to run —
+  # the second command adds it.
+  # Orca runs this as bash with `set -e`, cwd = the new worktree, and exports
+  # $ORCA_ROOT_PATH (primary checkout), $ORCA_WORKTREE_PATH, $ORCA_WORKSPACE_NAME.
+  setup: |
+    uv sync
+    uv pip install -r requirements.txt
+    # config.yaml is gitignored, so a worktree starts unconfigured. `if` rather
+    # than `&&`: under `set -e` a false test as the last statement would abort.
+    if [ -f "$ORCA_ROOT_PATH/config.yaml" ]; then
+      cp "$ORCA_ROOT_PATH/config.yaml" config.yaml
+    fi
+
+# Tab colours are gruvbox, matching the apis-mellifera hive theme that paints
+# the rest of this setup (vars/theme.nix there). #fe8019 is the shared
+# "active pane" accent; cream #ebdbb2 stands in for e-ink paper.
+defaultTabs:
+  - title: shell
+    color: "#fe8019"
+  # No command: `make serve` binds SERVER_PORT (default 4567), so
+  # auto-starting it would make the second worktree fail on a busy port.
+  # Run it manually, or `SERVER_PORT=4568 make serve` in a second worktree.
+  - title: serve
+    color: "#ebdbb2"
+  - title: tests
+    color: "#b8bb26"
