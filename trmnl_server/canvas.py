@@ -140,15 +140,18 @@ class Canvas:
         family: str = "sans",
         anchor: str = "la",
         tracking: int = 0,
+        ink: int = BLACK,
     ) -> None:
         """Draw `s`. `anchor` is a PIL anchor ("la" = left-ascender).
 
         `tracking` adds letter-spacing, which rescues all-caps labels at
         small sizes on e-ink where glyphs otherwise crowd together.
+        `ink=WHITE` knocks text out of a solid fill — the one way to make
+        a single row shout on a panel with no colour and no grey.
         """
         font = FONTS.get(size, bold=bold, family=family)
         if not tracking:
-            self.draw.text((x, y), s, font=font, fill=BLACK, anchor=anchor)
+            self.draw.text((x, y), s, font=font, fill=ink, anchor=anchor)
             return
 
         # PIL has no letter-spacing, so place glyphs individually. Only the
@@ -162,7 +165,7 @@ class Canvas:
             x -= total
         cursor = x
         for ch in s:
-            self.draw.text((cursor, y), ch, font=font, fill=BLACK,
+            self.draw.text((cursor, y), ch, font=font, fill=ink,
                            anchor="l" + anchor[1])
             cursor += int(self.draw.textlength(ch, font=font)) + tracking
 
@@ -178,6 +181,20 @@ class Canvas:
         font = FONTS.get(size, bold=bold, family=family)
         base = int(self.draw.textlength(s, font=font))
         return base + tracking * max(len(s) - 1, 0)
+
+    def clip(self, s: str, width: int, *, size: int = 16,
+             bold: bool = False) -> str:
+        """Trim `s` to `width` px, with an ellipsis when it had to be cut.
+
+        Nothing on an 800 px panel may overflow into its neighbour, and
+        much of what screens print is labels chosen elsewhere — a
+        mountpoint or a probed URL is as long as it happens to be.
+        """
+        if self.text_width(s, size=size, bold=bold) <= width:
+            return s
+        while s and self.text_width(s + "…", size=size, bold=bold) > width:
+            s = s[:-1]
+        return s + "…"
 
     def label(self, x: int, y: int, s: str, *, size: int = 13,
               anchor: str = "la") -> None:

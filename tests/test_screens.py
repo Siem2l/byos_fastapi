@@ -37,6 +37,7 @@ from trmnl_server.config import Config
 from trmnl_server.render import build_sources, render_screen
 from trmnl_server.screens import Context, available, get
 from trmnl_server.screens import homelab as homelab_screen
+from trmnl_server.screens import services as services_screen
 from trmnl_server.screens import stats as stats_screen
 from trmnl_server.sources import prometheus as prom_module
 from trmnl_server.sources.prometheus import (
@@ -337,24 +338,24 @@ def _ink(canvas: Canvas) -> float:
     return canvas.image.histogram()[0] / (WIDTH * HEIGHT)
 
 
-def test_the_registry_lists_all_three_screens():
-    assert available() == ["homelab", "readiness", "stats"]
+def test_the_registry_lists_every_screen():
+    assert available() == ["homelab", "readiness", "services", "stats"]
 
 
-@pytest.mark.parametrize("slug", ["homelab", "readiness", "stats"])
+@pytest.mark.parametrize("slug", ["homelab", "readiness", "services", "stats"])
 def test_every_screen_renders_a_1bit_panel(slug):
     canvas = _draw(slug, _sources())
     assert canvas.image.mode == "1"
     assert canvas.image.size == (WIDTH, HEIGHT)
 
 
-@pytest.mark.parametrize("slug", ["homelab", "stats"])
+@pytest.mark.parametrize("slug", ["homelab", "services", "stats"])
 def test_ink_coverage_suits_e_ink(slug):
     """Between 4% and 25%: a legible panel, not a solid black rectangle."""
     assert 0.04 < _ink(_draw(slug, _sources())) < 0.25
 
 
-@pytest.mark.parametrize("slug", ["homelab", "stats"])
+@pytest.mark.parametrize("slug", ["homelab", "services", "stats"])
 def test_synthetic_rendering_is_reproducible(slug):
     """Layout iteration depends on a diff meaning a code change, only."""
     first = _draw(slug, _sources()).image.tobytes()
@@ -362,7 +363,7 @@ def test_synthetic_rendering_is_reproducible(slug):
     assert first == second
 
 
-@pytest.mark.parametrize("slug", ["homelab", "stats"])
+@pytest.mark.parametrize("slug", ["homelab", "services", "stats"])
 def test_the_synthetic_source_answers_every_query_a_screen_asks(slug):
     """Anti-drift: a new PromQL string has to be taught to the stand-in.
 
@@ -449,7 +450,7 @@ class _Empty:
         return [None] * points
 
 
-@pytest.mark.parametrize("slug", ["homelab", "stats"])
+@pytest.mark.parametrize("slug", ["homelab", "services", "stats"])
 def test_a_screen_with_no_data_at_all_still_draws(slug):
     """Every tile empty is a legible page, not an exception and not a blank.
 
@@ -466,7 +467,7 @@ def test_homelab_reports_no_alerts_rather_than_no_data():
     data = get("homelab").fetch(Context(Config(), _sources(prometheus=_Empty())))
     assert data["alerts"] == []
     assert data["failed_units"] == []
-    assert data["targets"] == []
+    assert data["services"] == []
 
 
 def test_stats_handles_a_window_with_no_active_block():
@@ -510,7 +511,7 @@ def test_a_total_outage_reaches_the_caller_as_an_error():
         def series(self, query, **kwargs):
             raise PrometheusError("connection refused")
 
-    for slug in ("homelab", "stats"):
+    for slug in ("homelab", "services", "stats"):
         with pytest.raises(PrometheusError):
             get(slug).fetch(Context(Config(), _sources(prometheus=Down())))
 
@@ -555,10 +556,11 @@ def test_each_screen_is_exposed_as_a_rotation_entry():
     """The UI has no concept of a screen; it only sees plugins."""
     from trmnl_server.plugins.garmin import SLUG_BY_PLUGIN
 
-    assert set(SLUG_BY_PLUGIN.values()) == {"homelab", "readiness", "stats"}
+    assert set(SLUG_BY_PLUGIN.values()) == {
+        "homelab", "readiness", "services", "stats"}
 
 
-@pytest.mark.parametrize("slug", ["homelab", "stats"])
+@pytest.mark.parametrize("slug", ["homelab", "services", "stats"])
 def test_preview_route_renders_the_new_screens(client, slug):
     response = client.get(
         f"/preview/{slug}.png", headers={"Access-Token": "test-token"}
@@ -589,3 +591,72 @@ def test_the_fake_prometheus_speaks_the_real_wire_format(fake_prometheus):
     assert payload["status"] == "success"
     assert payload["data"]["resultType"] == "vector"
     assert payload["data"]["result"][0]["metric"] == {"job": "node"}
+
+
+# --- backups, storage and the services roll ---------------------------------
+
+
+def test_a_failed_backup_unit_overrides_a_fresh_trigger():
+    """A timer that fired an hour ago says nothing if the run then broke."""
+    class Broken(SyntheticPrometheusSource):
+        def vector(self, query):
+            if query == homelab_screen.Q_FAILED_UNITS:
+                return [Sample({"name": "restic-backups-vps.service"}, 1.0)]
+            return super().vector(query)
+
+    data = get("homelab").fetch(
+        Context(Config(), _sources(prometheus=Broken(calm=True))))
+    vps = next(b for b in data["backups"] if b["title"] == "Offsite VPS")
+    assert vps["failed"]
+    assert data["headline_bad"]
+
+
+def test_a_backup_timer_nobody_reports_is_not_dropped():
+    """A missing row would hide exactly the failure the band is for."""
+    data = get("homelab").fetch(Context(Config(), _sources(prometheus=_Empty())))
+    assert [b["title"] for b in data["backups"]] == [
+        title for title, _prefix, _overdue in homelab_screen.BACKUPS
+    ]
+    assert all(b["age"] is None for b in data["backups"])
+
+
+def test_a_disk_filling_soon_outranks_a_fuller_steady_one():
+    rows = homelab_screen._join_filesystems(
+        [Sample({"instance": "h", "device": "a", "mountpoint": "/a"}, 10.0),
+         Sample({"instance": "h", "device": "b", "mountpoint": "/b"}, 70.0)],
+        [Sample({"instance": "h", "device": "a", "mountpoint": "/a"}, 100.0),
+         Sample({"instance": "h", "device": "b", "mountpoint": "/b"}, 100.0)],
+        [Sample({"instance": "h", "device": "a"}, -5.0),
+         Sample({"instance": "h", "device": "b"}, 20 * 86400.0)],
+    )
+    assert [r["mount"] for r in rows] == ["h:/b", "h:/a"]
+    assert rows[1]["full_in"] is None
+
+
+def test_a_service_watched_twice_is_one_row_down_if_either_check_is():
+    rows = services_screen.merge_services(
+        [Sample({"job": "hivemind", "instance": "127.0.0.1:8830"}, 1.0),
+         Sample({"job": "blackbox-http",
+                 "instance": "https://hivemind.siem2l.nl"}, 1.0)],
+        [Sample({"instance": "https://hivemind.siem2l.nl"}, 0.0)],
+        [Sample({"instance": "https://hivemind.siem2l.nl"}, 0.1)],
+        [],
+    )
+    assert rows == [{"name": "hivemind", "up": False, "latency": 0.1,
+                     "cert_days": None}]
+
+
+def test_the_homelab_grid_counts_what_the_services_screen_lists():
+    sources = _sources()
+    homelab = get("homelab").fetch(Context(Config(), sources))
+    services = get("services").fetch(Context(Config(), sources))
+    assert len(homelab["services"]) == len(services["rows"])
+
+
+def test_a_down_service_is_knocked_out_of_the_roll():
+    """Solid black rows are what make 'which one' readable at a distance."""
+    broken = _ink(_draw("services", _sources(
+        prometheus=SyntheticPrometheusSource(calm=False))))
+    calm = _ink(_draw("services", _sources(
+        prometheus=SyntheticPrometheusSource(calm=True))))
+    assert broken > calm

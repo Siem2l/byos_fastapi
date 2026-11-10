@@ -146,6 +146,27 @@ _SYNTHETIC_FILESYSTEMS = [
     ("/mnt/backup", "backup", 4 << 40, 1229 << 30),
 ]
 
+# Seconds until each filesystem is full at last week's rate, by
+# mountpoint. `/` filling within the quarter is the shape hive really
+# had when this screen was drawn; a negative value is a disk whose free
+# space is growing, which the screen must read as "steady".
+_SYNTHETIC_FULL_IN = {
+    "/": 92 * 86400.0,
+    "/boot": -1.0,
+    "/mnt/storage": 40 * 86400.0,
+    "/mnt/backup": 900 * 86400.0,
+}
+
+# Seconds since each backup timer last fired. The non-calm scenario has
+# the nightly offsite run two days late, the failure the band is for.
+_SYNTHETIC_BACKUPS = {
+    "restic-backups-homelab.timer": (18 * 3600.0, 52 * 3600.0),
+    "restic-backups-vps.timer": (17 * 3600.0, 17 * 3600.0),
+    "restic-check-homelab.timer": (3 * 86400.0, 3 * 86400.0),
+    "restic-drill-homelab.timer": (37 * 3600.0, 37 * 3600.0),
+    "btrbk-local.timer": (38 * 60.0, 38 * 60.0),
+}
+
 
 class SyntheticPrometheusSource:
     """A stand-in for PrometheusSource, answering the queries the screens ask.
@@ -203,8 +224,10 @@ class SyntheticPrometheusSource:
 
     def _table(self) -> dict[str, list[Sample]]:
         from ..screens import homelab as hl
+        from ..screens import services as sv
         from ..screens import stats as st
 
+        rng = random.Random(f"{self.seed}:table")
         down = () if self.calm else (_SYNTHETIC_DOWN,)
         probe_down = () if self.calm else (_SYNTHETIC_PROBE_DOWN,)
         targets = [
@@ -255,6 +278,41 @@ class SyntheticPrometheusSource:
                         "mountpoint": mount}, float(size))
                 for mount, device, size, _free in _SYNTHETIC_FILESYSTEMS
             ],
+            hl.Q_FS_FULL_IN: [
+                Sample({"instance": "127.0.0.1:9002", "device": device,
+                        "mountpoint": mount}, _SYNTHETIC_FULL_IN[mount])
+                for mount, device, _size, _free in _SYNTHETIC_FILESYSTEMS
+            ],
+            hl.Q_BACKUP_AGE: [
+                Sample({"name": name}, calm if self.calm else broken)
+                for name, (calm, broken) in _SYNTHETIC_BACKUPS.items()
+            ],
+            # Every endpoint answers in about a tenth of a second except
+            # one slow one, and one cert has fallen inside the warning
+            # window, so both of the services screen's notes are drawn.
+            sv.Q_LATENCY: [
+                Sample({"job": "blackbox-http", "instance": instance},
+                       1.84 if "photos" in instance
+                       else round(rng.uniform(0.07, 0.24), 3))
+                for job, instance in _SYNTHETIC_JOBS
+                if job == "blackbox-http"
+            ],
+            sv.Q_CERT_DAYS: [
+                Sample({"job": "blackbox-http", "instance": instance},
+                       9.4 if "wiki" in instance else 36.6)
+                for job, instance in _SYNTHETIC_JOBS
+                if job == "blackbox-http"
+            ],
+            hl.Q_UPTIME: [Sample({}, 2 * 86400.0 + 3 * 3600.0)],
+            hl.Q_TEMPS: [
+                Sample({"chip": "platform_coretemp_0"}, 41.0),
+                Sample({"chip": "nvme_nvme0"}, 34.85),
+            ],
+            # One device: the SSD stopgap, before the HDDs arrive.
+            hl.Q_STORAGE_DISKS: [Sample({}, 1.0)],
+            hl.Q_STORAGE_ERRORS: [Sample({}, 0.0)],
+            hl.Q_HOUSE_OPEN: [Sample({}, 9.0)],
+            hl.Q_HOUSE_APPLIED: [Sample({}, 8.0)],
             st.Q_TOKENS_TODAY: _typed({
                 "input": 412_000, "output": 96_400,
                 "cache_creation": 1_840_000, "cache_read": 22_400_000,
