@@ -660,3 +660,18 @@ def test_a_down_service_is_knocked_out_of_the_roll():
     calm = _ink(_draw("services", _sources(
         prometheus=SyntheticPrometheusSource(calm=True))))
     assert broken > calm
+
+
+def test_a_backup_with_no_recorded_success_makes_the_headline():
+    """No metric means no success since it was introduced: that is news."""
+    class NoDrill(SyntheticPrometheusSource):
+        def vector(self, query):
+            if query == homelab_screen.Q_BACKUP_AGE:
+                return [s for s in super().vector(query)
+                        if not s.label("name").startswith("restic-drill")]
+            return super().vector(query)
+
+    data = get("homelab").fetch(
+        Context(Config(), _sources(prometheus=NoDrill(calm=True))))
+    assert data["headline_bad"]
+    assert "Restore drill" in data["headline"]

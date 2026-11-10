@@ -160,10 +160,9 @@ _SYNTHETIC_FULL_IN = {
 # Seconds since each backup timer last fired. The non-calm scenario has
 # the nightly offsite run two days late, the failure the band is for.
 _SYNTHETIC_BACKUPS = {
-    "restic-backups-homelab.timer": (18 * 3600.0, 52 * 3600.0),
-    "restic-backups-vps.timer": (17 * 3600.0, 17 * 3600.0),
-    "restic-check-homelab.timer": (3 * 86400.0, 3 * 86400.0),
-    "restic-drill-homelab.timer": (37 * 3600.0, 37 * 3600.0),
+    "restic-backups-homelab": (18 * 3600.0, 52 * 3600.0),
+    "restic-backups-vps": (17 * 3600.0, 17 * 3600.0),
+    "restic-drill-homelab": (37 * 3600.0, 37 * 3600.0),
     "btrbk-local.timer": (38 * 60.0, 38 * 60.0),
 }
 

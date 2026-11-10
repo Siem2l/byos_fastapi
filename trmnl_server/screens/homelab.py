@@ -111,13 +111,20 @@ Q_FAILED_UNITS = 'node_systemd_unit_state{state="failed"} == 1'
 Q_UPTIME = 'time() - node_boot_time_seconds{job="node"}'
 Q_TEMPS = 'max by (chip) (node_hwmon_temp_celsius{job="node"})'
 
-# When each backup timer last fired. A trigger is not a success — the
-# run can still fail — which is why a failed unit overrides the age in
-# the row. Between the two, the band catches both a timer that stopped
-# and a run that broke.
+# How long since each backup last *succeeded*, folded into one vector
+# keyed by unit name so `BACKUPS` can match on prefixes. restic reports
+# its own successes (textfile metrics written only after a clean exit);
+# a timer's last trigger would say when a run started, and on the night
+# this was written every restic run had started and then died waiting
+# for a lock. btrbk has no success metric, so its row falls back to the
+# trigger, and a failed unit still overrides every row.
 Q_BACKUP_AGE = (
-    "time() - node_systemd_timer_last_trigger_seconds"
-    '{name=~"(restic-(backups|drill)|btrbk)-.*"}'
+    'label_replace(time() - restic_backup_last_success_seconds,'
+    ' "name", "restic-backups-$1", "name", "(.+)")'
+    ' or label_replace(time() - restic_drill_last_success_seconds,'
+    ' "name", "restic-drill-$1", "name", "(.+)")'
+    ' or (time() - node_systemd_timer_last_trigger_seconds'
+    '{name=~"btrbk-.*"})'
 )
 
 # Pseudo-filesystems are excluded at the query rather than after the
@@ -329,8 +336,11 @@ def _headline(d: dict) -> tuple[str, bool]:
     broken = [b for b in d["backups"] if b["failed"]]
     if broken:
         return f"{broken[0]['title']} backup failed", True
-    late = [b for b in d["backups"]
-            if b["age"] is not None and b["age"] > b["overdue"]]
+    unknown = [b for b in d["backups"]
+               if b["age"] is None or b["age"] >= NEVER]
+    if unknown:
+        return f"{unknown[0]['title']}: no successful backup on record", True
+    late = [b for b in d["backups"] if b["age"] > b["overdue"]]
     if late:
         worst = late[0]
         return f"{worst['title']} backup is {_age(worst['age'])} old", True
