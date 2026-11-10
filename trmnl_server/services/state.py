@@ -116,6 +116,27 @@ def ensure_device_profile(device_id: str) -> Dict[str, Any]:
     return profile
 
 
+def initialize_device_profiles_from_storage() -> None:
+    """Warm the profile cache from the database.
+
+    `/devices` lists what this process has seen, and before this a device
+    was only seen once it called in. A restart therefore emptied the
+    Devices page until each panel's next wake — up to its whole refresh
+    interval — although every profile was sitting in the database. The
+    default pseudo-device is skipped: it is a playlist target, not
+    hardware, and `known_device_ids` adds it back on request.
+    """
+    profiles = {
+        profile['device_id']: profile
+        for profile in models.list_device_profiles()
+        if profile['device_id'] != DEFAULT_DEVICE_ID
+    }
+    with STATE_LOCK:
+        cache = _device_profile_cache()
+        for device_id, profile in profiles.items():
+            cache.setdefault(device_id, profile)
+
+
 def refresh_device_profile(device_id: str) -> Dict[str, Any]:
     profile = models.ensure_device_profile(device_id)
     with STATE_LOCK:

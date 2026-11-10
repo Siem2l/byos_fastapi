@@ -556,6 +556,12 @@ def get_device_profile(device_id: str) -> Optional[Dict[str, Optional[str]]]:
         return _profile_to_dict(profile)
 
 
+def list_device_profiles() -> List[Dict[str, Optional[str]]]:
+    """Every stored profile, for warming the in-memory cache at startup."""
+    with SessionLocal() as db:
+        return [_profile_to_dict(p) for p in db.query(DeviceProfile).all()]
+
+
 def ensure_device_profile(device_id: str) -> Dict[str, Optional[str]]:
     timestamp = _utcnow()
     with SessionLocal() as db:

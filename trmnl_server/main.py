@@ -232,6 +232,7 @@ def create_app(cfg: Config) -> FastAPI:
     async def lifespan(_app: FastAPI):
         state.set_server_base_url(cfg.base_url)
         state.initialize_rotation_playlists_from_storage()
+        state.initialize_device_profiles_from_storage()
         # Render once up front so the UI has rotation entries (and the
         # Playlists tab has something to show) on the very first page load
         # rather than after the first refresh interval elapses.

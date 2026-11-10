@@ -92,3 +92,20 @@ def test_a_ui_edit_survives_a_restart(boot):
     after, _ = boot()
 
     assert len(after) == 1, f"UI edit was discarded on restart (got {after})"
+
+
+def test_a_known_device_is_listed_straight_after_a_restart(boot):
+    """The Devices page must not empty out until each panel next wakes.
+
+    Profiles are stored the moment a device enrols, but `/devices` lists the
+    in-memory cache, which a restart used to leave holding nothing but what
+    had called in since.
+    """
+    _, state = boot()
+    state.ensure_device_profile("E0:72:A1:FA:42:F0")
+
+    _, state = boot()
+
+    assert state.known_device_ids(include_default=False) == [
+        "E0:72:A1:FA:42:F0"
+    ]
