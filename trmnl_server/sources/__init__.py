@@ -1,6 +1,7 @@
 """Data sources. Each is duck-typed against what its screens ask for."""
 
 from .garmin import GarminSource  # noqa: F401
+from .life import LifeSource, SyntheticLifeSource  # noqa: F401
 from .prometheus import (  # noqa: F401
     Probe,
     PrometheusError,
@@ -14,10 +15,12 @@ from .synthetic import (  # noqa: F401
 
 __all__ = [
     "GarminSource",
+    "LifeSource",
     "Probe",
     "PrometheusError",
     "PrometheusSource",
     "Sample",
     "SyntheticGarminSource",
+    "SyntheticLifeSource",
     "SyntheticPrometheusSource",
 ]

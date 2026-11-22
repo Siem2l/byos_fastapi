@@ -9,8 +9,10 @@ from .config import Config
 from .screens import Context, get
 from .sources import (
     GarminSource,
+    LifeSource,
     PrometheusSource,
     SyntheticGarminSource,
+    SyntheticLifeSource,
     SyntheticPrometheusSource,
 )
 
@@ -20,6 +22,7 @@ def build_sources(config: Config, *, synthetic: bool = False) -> dict:
         return {
             "garmin": SyntheticGarminSource(),
             "prometheus": SyntheticPrometheusSource(),
+            "life": SyntheticLifeSource(),
         }
     return {
         "garmin": GarminSource(config.garmin_db_dir),
@@ -29,6 +32,7 @@ def build_sources(config: Config, *, synthetic: bool = False) -> dict:
         # glass instead of a LookupError from `ctx.source()` that reads
         # as a missing screen.
         "prometheus": PrometheusSource(config.prometheus_url),
+        "life": LifeSource(config.state_dir),
     }
 
 
