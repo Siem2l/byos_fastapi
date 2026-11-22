@@ -92,6 +92,15 @@ def test_display_cycle_serves_1bit_bmp(client):
     assert frame.size == (800, 480)
 
 
+def test_display_forces_full_refresh(client):
+    # Without it the firmware never full-refreshes a BMP frame and the panel
+    # ghosts its way into a mix of two screens.
+    body = client.get(
+        "/api/display", headers={"ID": MAC, "Access-Token": TOKEN}
+    ).json()
+    assert body["maximum_compatibility"] is True
+
+
 def test_image_route_rejects_predictable_paths(client):
     assert client.get("/image/screen.bmp").status_code == 404
     assert client.get("/image/screen-001-deadbeef.bmp").status_code == 404

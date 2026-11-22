@@ -525,6 +525,13 @@ def api_display(request: Request) -> JSONResponse:
         "reset_firmware": False,
         "update_firmware": False,
         "special_function": "sleep",
+        # Forces a full e-ink refresh on every frame. The firmware only does a
+        # full refresh every 8th update, but its BMP path resets that counter
+        # each frame (draw_image in display.cpp), so BMP frames are partial
+        # forever. Partial updates between two unrelated screens accumulate
+        # ghosting until the panel sits half-way between both; only a power
+        # cycle (which drops the RTC counter) cleared it.
+        "maximum_compatibility": True,
     })
 
 
