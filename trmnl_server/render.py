@@ -9,9 +9,11 @@ from .config import Config
 from .screens import Context, get
 from .sources import (
     GarminSource,
+    HomeAssistantSource,
     LifeSource,
     PrometheusSource,
     SyntheticGarminSource,
+    SyntheticHomeAssistantSource,
     SyntheticLifeSource,
     SyntheticPrometheusSource,
 )
@@ -23,6 +25,7 @@ def build_sources(config: Config, *, synthetic: bool = False) -> dict:
             "garmin": SyntheticGarminSource(),
             "prometheus": SyntheticPrometheusSource(),
             "life": SyntheticLifeSource(),
+            "home_assistant": SyntheticHomeAssistantSource(),
         }
     return {
         "garmin": GarminSource(config.garmin_db_dir),
@@ -33,6 +36,8 @@ def build_sources(config: Config, *, synthetic: bool = False) -> dict:
         # as a missing screen.
         "prometheus": PrometheusSource(config.prometheus_url),
         "life": LifeSource(config.state_dir),
+        "home_assistant": HomeAssistantSource(
+            config.home_assistant_url, config.home_assistant_token_file),
     }
 
 

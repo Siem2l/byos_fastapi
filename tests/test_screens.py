@@ -46,6 +46,7 @@ from trmnl_server.sources.prometheus import (
     PrometheusSource,
     Sample,
 )
+from trmnl_server.sources.home_assistant import SyntheticHomeAssistantSource
 from trmnl_server.sources.life import SyntheticLifeSource
 from trmnl_server.sources.synthetic import (
     SyntheticGarminSource,
@@ -323,6 +324,7 @@ def _sources(**overrides) -> dict:
         "garmin": SyntheticGarminSource(),
         "prometheus": SyntheticPrometheusSource(),
         "life": SyntheticLifeSource(),
+        "home_assistant": SyntheticHomeAssistantSource(),
     }
     sources.update(overrides)
     return sources
@@ -341,24 +343,26 @@ def _ink(canvas: Canvas) -> float:
 
 
 def test_the_registry_lists_every_screen():
-    assert available() == ["homelab", "life", "readiness", "services", "stats"]
+    assert available() == ["home", "homelab", "life", "readiness", "services", "stats"]
 
 
 @pytest.mark.parametrize(
-    "slug", ["homelab", "life", "readiness", "services", "stats"])
+    "slug", ["home", "homelab", "life", "readiness", "services", "stats"])
 def test_every_screen_renders_a_1bit_panel(slug):
     canvas = _draw(slug, _sources())
     assert canvas.image.mode == "1"
     assert canvas.image.size == (WIDTH, HEIGHT)
 
 
-@pytest.mark.parametrize("slug", ["homelab", "life", "services", "stats"])
+@pytest.mark.parametrize(
+    "slug", ["home", "homelab", "life", "services", "stats"])
 def test_ink_coverage_suits_e_ink(slug):
     """Between 4% and 25%: a legible panel, not a solid black rectangle."""
     assert 0.04 < _ink(_draw(slug, _sources())) < 0.25
 
 
-@pytest.mark.parametrize("slug", ["homelab", "life", "services", "stats"])
+@pytest.mark.parametrize(
+    "slug", ["home", "homelab", "life", "services", "stats"])
 def test_synthetic_rendering_is_reproducible(slug):
     """Layout iteration depends on a diff meaning a code change, only."""
     first = _draw(slug, _sources()).image.tobytes()
@@ -560,10 +564,11 @@ def test_each_screen_is_exposed_as_a_rotation_entry():
     from trmnl_server.plugins.garmin import SLUG_BY_PLUGIN
 
     assert set(SLUG_BY_PLUGIN.values()) == {
-        "homelab", "life", "readiness", "services", "stats"}
+        "home", "homelab", "life", "readiness", "services", "stats"}
 
 
-@pytest.mark.parametrize("slug", ["homelab", "life", "services", "stats"])
+@pytest.mark.parametrize(
+    "slug", ["home", "homelab", "life", "services", "stats"])
 def test_preview_route_renders_the_new_screens(client, slug):
     response = client.get(
         f"/preview/{slug}.png", headers={"Access-Token": "test-token"}

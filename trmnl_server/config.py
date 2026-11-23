@@ -405,6 +405,13 @@ class Config:
     # configured one would be a surprising outbound connection.
     prometheus_url: str = field(default_factory=lambda: environ.get(
         'TRMNL_PROMETHEUS_URL', '').rstrip('/'))
+    # Home Assistant for the `home` screen, same off-by-default shape as
+    # Prometheus. The token is a long-lived access token, read from a file
+    # on every request so it never sits in the unit or /proc.
+    home_assistant_url: str = field(default_factory=lambda: environ.get(
+        'TRMNL_HOME_ASSISTANT_URL', '').rstrip('/'))
+    home_assistant_token_file: str = field(default_factory=lambda: environ.get(
+        'TRMNL_HOME_ASSISTANT_TOKEN_FILE', ''))
     # Playlist: screens are served round-robin in this order.
     playlist: list[str] = field(default_factory=lambda: _env_list(
         'TRMNL_PLAYLIST', ['readiness']))
