@@ -310,8 +310,6 @@ class SyntheticPrometheusSource:
             # One device: the SSD stopgap, before the HDDs arrive.
             hl.Q_STORAGE_DISKS: [Sample({}, 1.0)],
             hl.Q_STORAGE_ERRORS: [Sample({}, 0.0)],
-            hl.Q_HOUSE_OPEN: [Sample({}, 9.0)],
-            hl.Q_HOUSE_APPLIED: [Sample({}, 8.0)],
             st.Q_TOKENS_TODAY: _typed({
                 "input": 412_000, "output": 96_400,
                 "cache_creation": 1_840_000, "cache_read": 22_400_000,

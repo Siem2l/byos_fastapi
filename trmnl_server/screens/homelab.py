@@ -149,10 +149,6 @@ _STORAGE = '* on (uuid) group_left (label) node_btrfs_info{label="storage"}'
 Q_STORAGE_DISKS = f"count(node_btrfs_device_size_bytes {_STORAGE})"
 Q_STORAGE_ERRORS = f"sum(node_btrfs_device_errors_total {_STORAGE})"
 
-# The rental-listing watcher on the VPS (textfile metrics, `rebo_*`).
-Q_HOUSE_OPEN = 'sum(rebo_listings{verdict="match",available="1"})'
-Q_HOUSE_APPLIED = "max(rebo_applied_total)"
-
 
 def _short_target(sample: Sample) -> str:
     """A name for one scrape target, short enough to sit in a footnote.
@@ -390,8 +386,6 @@ class HomelabScreen(Screen):
         temps = _temps(probe.vector(Q_TEMPS))
         storage_disks = probe.instant(Q_STORAGE_DISKS)
         storage_errors = probe.instant(Q_STORAGE_ERRORS)
-        house_open = probe.instant(Q_HOUSE_OPEN)
-        house_applied = probe.instant(Q_HOUSE_APPLIED)
 
         # Nothing answered at all: that is one fact about the monitoring,
         # not a dozen facts about the homelab, and the panel should show
@@ -433,10 +427,6 @@ class HomelabScreen(Screen):
                 "disks": None if storage_disks is None else int(storage_disks),
                 "errors": storage_errors,
             },
-            "house": (
-                None if house_open is None and house_applied is None
-                else {"open": house_open, "applied": house_applied}
-            ),
         }
         data["headline"], data["headline_bad"] = _headline(data)
         return data
@@ -709,15 +699,6 @@ class HomelabScreen(Screen):
             else:
                 items.append((False, "HDDs → RAID1",
                               "waiting · storage on the SSD"))
-
-        house = d["house"]
-        if house is not None:
-            parts = []
-            if house["open"] is not None:
-                parts.append(f"{house['open']:.0f} matches open")
-            if house["applied"] is not None:
-                parts.append(f"{house['applied']:.0f} applied")
-            items.append((False, "House hunt", " · ".join(parts)))
 
         if not items:
             c.text(box.x, box.y + 26, "nothing tracked", size=14)
