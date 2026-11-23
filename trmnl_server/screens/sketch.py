@@ -11,6 +11,11 @@ The styles rotate so consecutive hours never repeat one:
 * contours — a topographic map of a noise field, every fourth line bold;
 * circles — a packing of rings, outlines and solid dots.
 
+Every other hour the same styles draw a painting instead of noise
+(`painted.py`): the drawing stays lines and rings, and the painting shows
+through it roughly. Six paintings, cycling independently of the styles,
+so each comes back in a different style.
+
 Everything is drawn as 1-bit lines on purpose: e-ink renders a crisp
 stroke beautifully and a dithered grey as mud.
 """
@@ -22,6 +27,7 @@ import random
 from datetime import datetime
 
 from ..canvas import BLACK, WHITE, Box, Canvas
+from . import painted
 from .base import Context, Screen, register
 
 PIECE_MINUTES = 60
@@ -66,6 +72,13 @@ def piece_number(now: datetime) -> int:
 
 def style_for(number: int) -> str:
     return STYLES[number % len(STYLES)]
+
+
+def painting_for(number: int) -> painted.Painting | None:
+    """The painting an hour draws, or None for a purely generative hour."""
+    if number % 2 == 0:
+        return None
+    return painted.PAINTINGS[(number // 2) % len(painted.PAINTINGS)]
 
 
 # ---- styles -------------------------------------------------------------
@@ -228,9 +241,14 @@ DRAW = {
 
 
 def compose(c: Canvas, number: int) -> str:
+    """Draw piece `number`; return its caption."""
     style = style_for(number)
-    DRAW[style](c, ART, random.Random(number))
-    return style
+    painting = painting_for(number)
+    if painting is None:
+        DRAW[style](c, ART, random.Random(number))
+        return style.upper()
+    painted.draw(c, ART, style, painting, random.Random(number))
+    return f"{painting.title} · {painting.artist} · {style}".upper()
 
 
 @register
@@ -244,11 +262,13 @@ class SketchScreen(Screen):
         return {"number": piece_number(now), "at": now}
 
     def render(self, c: Canvas, d: dict) -> None:
-        style = compose(c, d["number"])
+        caption = compose(c, d["number"])
         y = c.height - 30
         c.hline(ART.x, y, ART.right, weight=1)
-        c.text(ART.x, y + 8, style.upper(), size=11, bold=True, tracking=2)
-        c.text(ART.right, y + 8,
-               f"NO. {d['number'] % 100000:05d} · "
-               f"{d['at'].strftime('%a %d %b %H:00').upper()}",
-               size=11, bold=True, anchor="ra", tracking=1)
+        stamp = (f"NO. {d['number'] % 100000:05d} · "
+                 f"{d['at'].strftime('%a %d %b %H:00').upper()}")
+        stamp_w = c.text_width(stamp, size=11, bold=True, tracking=1)
+        c.text(ART.x, y + 8, c.clip(caption, ART.w - stamp_w - 16, size=11,
+                                    bold=True), size=11, bold=True, tracking=2)
+        c.text(ART.right, y + 8, stamp, size=11, bold=True, anchor="ra",
+               tracking=1)

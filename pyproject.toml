@@ -31,4 +31,4 @@ include = ["trmnl_server*"]
 # identically from a source checkout and from the Nix store, with no
 # `postInstall` copy and no extra environment variable.
 [tool.setuptools.package-data]
-trmnl_server = ["web/**/*"]
+trmnl_server = ["web/**/*", "screens/paintings/*.png"]
