@@ -343,11 +343,11 @@ def _ink(canvas: Canvas) -> float:
 
 
 def test_the_registry_lists_every_screen():
-    assert available() == ["home", "homelab", "life", "readiness", "services", "stats"]
+    assert available() == ["home", "homelab", "life", "readiness", "services", "sketch", "stats"]
 
 
 @pytest.mark.parametrize(
-    "slug", ["home", "homelab", "life", "readiness", "services", "stats"])
+    "slug", ["home", "homelab", "life", "readiness", "services", "sketch", "stats"])
 def test_every_screen_renders_a_1bit_panel(slug):
     canvas = _draw(slug, _sources())
     assert canvas.image.mode == "1"
@@ -564,7 +564,7 @@ def test_each_screen_is_exposed_as_a_rotation_entry():
     from trmnl_server.plugins.garmin import SLUG_BY_PLUGIN
 
     assert set(SLUG_BY_PLUGIN.values()) == {
-        "home", "homelab", "life", "readiness", "services", "stats"}
+        "home", "homelab", "life", "readiness", "services", "sketch", "stats"}
 
 
 @pytest.mark.parametrize(

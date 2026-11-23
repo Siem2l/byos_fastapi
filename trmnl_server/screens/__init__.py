@@ -7,5 +7,6 @@ from . import stats  # noqa: F401  (ditto)
 from . import services  # noqa: F401  (ditto)
 from . import life  # noqa: F401  (ditto)
 from . import home  # noqa: F401  (ditto)
+from . import sketch  # noqa: F401  (ditto)
 
 __all__ = ["REGISTRY", "Context", "Screen", "available", "get", "register"]
